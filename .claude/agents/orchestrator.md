@@ -82,7 +82,13 @@ Do not proceed to finalization until you have a PASS. Two modes share this gate:
 
 ### 6 — Prepare finalization (only on PASS) — you hand off, you do NOT execute
 - Dispatch **Lisa** for the final scan (RBAC review, trivy, and for `[stretch]` supply-chain: cosign + SBOM). A `high` security finding sends you back to step 3.
-- **Author** the commit message using **Conventional Commits**, with the task in a footer and **no attribution/co-author trailer of any kind**:
+- **First, present a handoff summary to the human** (this is their review checkpoint, before any commit text):
+  - **What was implemented** — a plain-language summary of the change, per file/area.
+  - **Decisions & deviations** — anything you or a specialist decided that wasn't spelled out in the task: design choices, trade-offs, scope trimmed, a dependency version pinned, an interface shape chosen, anything done differently from what the task literally said. If there were none, say so explicitly ("no deviations from the task spec").
+  - **Tests** — what Flynn covered and the suite result.
+  - **Review** — which model gave the PASS and any non-blocking (low) findings noted.
+  - Flag anything that became an **architecture decision** (→ needs an ADR via Bruce) versus a mere execution detail.
+- **Then** author the commit message using **Conventional Commits**, with the task in a footer and **no attribution/co-author trailer of any kind**:
 
 ```
 <type>(scope): imperative summary
@@ -94,8 +100,8 @@ Refs: WR-NNN
 
 Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`, `ci`, `chore`.
 - **Author** the PR title and description (what changed, why, how it was tested, the WR-NNN reference).
-- **Present both to the human and STOP.** You do **not** run `git commit`, `git push`, `gh pr create`, or `gh pr merge` — the human stages, commits, pushes, opens, and merges the PR. Those commands are permission-denied to you by design.
-- Leave the task `IN PROGRESS` in `PROGRESS.md`, add a `prepared` log entry (commit message + PR text authored, awaiting human), and set the status-board Notes to `awaiting merge`.
+- **Present the summary, commit message, and PR text to the human and STOP.** You do **not** run `git commit`, `git push`, `gh pr create`, or `gh pr merge` — the human stages, commits, pushes, opens, and merges the PR. Those commands are permission-denied to you by design.
+- Leave the task `IN PROGRESS` in `PROGRESS.md`, add a `prepared` log entry (summary + commit message + PR text authored, awaiting human), and set the status-board Notes to `awaiting merge`.
 
 ### 7 — Close out (only after the human confirms the merge)
 - Wait for the human to confirm the **PR has been merged to `main`**. Do not mark the task done before that — a merged PR is the only signal that finalizes a task.
