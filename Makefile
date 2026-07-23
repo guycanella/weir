@@ -1,0 +1,167 @@
+SHELL := /usr/bin/env bash
+.DEFAULT_GOAL := help
+
+# =====================================================================
+# Weir — Makefile
+# The single source of truth for "how you run things in this project".
+# Every agent (Lucas, Flynn, Julia, John, Viktor, Bob, Ana, Lisa, Bruce)
+# should prefer `make <target>` over raw commands so behavior is identical
+# across the swarm. Referenced by CLAUDE.md, settings.json, and WR-003.
+#
+# Targets that depend on later phases (kubebuilder, kind, LocalStack, KEDA,
+# Helm) are wired but guarded: if a required tool isn't installed yet, the
+# target prints what it needs and the WR task that introduces it, instead of
+# failing cryptically. Fill them in as those phases land.
+# =====================================================================
+
+# --- Project ---------------------------------------------------------
+MODULE        ?= github.com/you/weir
+KIND_CLUSTER  ?= weir
+IMG_OPERATOR  ?= ghcr.io/you/weir-operator
+IMG_WORKER    ?= ghcr.io/you/weir-worker
+
+# --- Local ($0) environment: kind + LocalStack -----------------------
+AWS_ENDPOINT_URL     ?= http://localhost:4566
+AWS_REGION           ?= us-east-2
+LOCALSTACK_CONTAINER ?= weir-localstack
+LOCALSTACK_SERVICES  ?= s3,sns,sqs,lambda
+
+# --- Tooling (pin the compatible set in WR-002) ----------------------
+LOCALBIN            := $(CURDIR)/bin
+ENVTEST_K8S_VERSION ?= 1.31.0
+CONTROLLER_GEN      := $(LOCALBIN)/controller-gen
+SETUP_ENVTEST       := $(LOCALBIN)/setup-envtest
+
+$(LOCALBIN):
+	@mkdir -p $(LOCALBIN)
+
+# Small guard: fail with a helpful message if a required command is missing.
+# usage:  $(call need,kind,WR-004 sets this up)
+define need
+	command -v $(1) >/dev/null 2>&1 || { \
+	  echo "✗ '$(1)' not found on PATH — $(2)"; exit 1; }
+endef
+
+##@ General
+
+.PHONY: help
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} \
+	  /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } \
+	  /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
+
+##@ Development
+
+.PHONY: tidy
+tidy: ## Tidy and verify go modules
+	go mod tidy
+
+.PHONY: fmt
+fmt: ## Format Go code
+	gofmt -l -w .
+
+.PHONY: vet
+vet: ## Run go vet
+	go vet ./...
+
+.PHONY: lint
+lint: ## Run golangci-lint
+	@$(call need,golangci-lint,install: https://golangci-lint.run/welcome/install/)
+	golangci-lint run
+
+.PHONY: build
+build: ## Compile all packages
+	go build ./...
+
+.PHONY: clean
+clean: ## Remove build/test artifacts
+	rm -rf $(LOCALBIN) cover.out
+	go clean
+
+##@ Testing
+
+.PHONY: test
+test: ## Run fast unit tests (race + coverage) — the TDD inner loop
+	go test ./... -race -coverprofile=cover.out
+
+.PHONY: cover
+cover: test ## Show coverage summary
+	go tool cover -func=cover.out
+
+.PHONY: test-integration
+test-integration: ## Run kind + LocalStack integration tests (needs deploy-local)
+	@$(call need,kind,WR-004 sets up the local cluster)
+	@docker ps --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$' || { \
+	  echo "✗ LocalStack not running — start it with 'make localstack-up' (WR-004)"; exit 1; }
+	AWS_ENDPOINT_URL=$(AWS_ENDPOINT_URL) AWS_REGION=$(AWS_REGION) \
+	  go test -tags=integration ./... -count=1
+
+##@ Code generation (kubebuilder / controller-gen — WR-011..WR-014)
+
+.PHONY: manifests
+manifests: ## Generate CRDs + RBAC manifests
+	@test -x $(CONTROLLER_GEN) || { \
+	  echo "→ controller-gen not installed yet. Run 'make tools' (added in WR-011)."; exit 0; }
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook \
+	  paths="./..." output:crd:artifacts:config=config/crd/bases
+
+.PHONY: generate
+generate: ## Generate deepcopy code
+	@test -x $(CONTROLLER_GEN) || { \
+	  echo "→ controller-gen not installed yet. Run 'make tools' (added in WR-011)."; exit 0; }
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+##@ Images (ko — WR-026)
+
+.PHONY: image
+image: ## Build the worker/operator images with ko
+	@$(call need,ko,WR-026 introduces ko for image builds)
+	KO_DOCKER_REPO=$(IMG_WORKER) ko build ./cmd/worker --local
+
+##@ Local environment ($0: kind + LocalStack — WR-004)
+
+.PHONY: kind-up
+kind-up: ## Create the local kind cluster
+	@$(call need,kind,WR-004 sets up the local cluster)
+	kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || kind create cluster --name $(KIND_CLUSTER)
+
+.PHONY: kind-down
+kind-down: ## Delete the local kind cluster
+	@$(call need,kind,WR-004 sets up the local cluster)
+	kind delete cluster --name $(KIND_CLUSTER) || true
+
+.PHONY: localstack-up
+localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker
+	@$(call need,docker,LocalStack runs in a container)
+	docker ps --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$' || \
+	  docker run -d --name $(LOCALSTACK_CONTAINER) -p 4566:4566 \
+	    -e SERVICES=$(LOCALSTACK_SERVICES) localstack/localstack
+
+.PHONY: localstack-down
+localstack-down: ## Stop and remove LocalStack
+	@$(call need,docker,LocalStack runs in a container)
+	docker rm -f $(LOCALSTACK_CONTAINER) 2>/dev/null || true
+
+.PHONY: deploy-local
+deploy-local: kind-up localstack-up ## Bring up the full local stack (cluster + LocalStack + operator)
+	@echo "✓ kind + LocalStack are up."
+	@echo "→ TODO: install KEDA (WR-036), then Helm-install the operator (WR-051)."
+	@echo "  Prefer 'tilt up' once the Tiltfile exists (WR-004) for the live dev loop."
+
+.PHONY: undeploy-local
+undeploy-local: localstack-down kind-down ## Tear down the full local stack
+	@echo "✓ Local stack torn down."
+
+##@ Tooling
+
+.PHONY: tools
+tools: $(LOCALBIN) ## Install pinned dev tools into ./bin (controller-gen, setup-envtest)
+	@echo "→ Pin versions in WR-002, then install controller-gen and setup-envtest here."
+	@echo "  e.g. GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@<pinned>"
+	@echo "       GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@<pinned>"
+
+.PHONY: envtest
+envtest: $(LOCALBIN) ## Set up envtest binaries for controller tests (WR-034)
+	@test -x $(SETUP_ENVTEST) || { \
+	  echo "→ setup-envtest not installed yet. Run 'make tools' first (WR-034)."; exit 0; }
+	$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path

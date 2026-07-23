@@ -1,0 +1,12 @@
+# docs
+DOCUMENTATION.md
+IMPLEMENTATION.md
+PROGRESS.md
+
+.codegraph/
+bin/
+cover.out
+.env
+.env.*
+secrets/
+.claude/settings.json
