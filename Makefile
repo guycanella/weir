@@ -26,11 +26,20 @@ AWS_REGION           ?= us-east-2
 LOCALSTACK_CONTAINER ?= weir-localstack
 LOCALSTACK_SERVICES  ?= s3,sns,sqs,lambda
 
-# --- Tooling (pin the compatible set in WR-002) ----------------------
-LOCALBIN            := $(CURDIR)/bin
-ENVTEST_K8S_VERSION ?= 1.31.0
-CONTROLLER_GEN      := $(LOCALBIN)/controller-gen
-SETUP_ENVTEST       := $(LOCALBIN)/setup-envtest
+# --- Tooling (pinned compatible set — see TOOLS.md for the why) ------
+# Kubernetes 1.35 generation, chosen because KEDA 2.20's tested window is
+# v1.33-v1.35 (https://keda.sh/docs/2.20/operate/cluster/), one minor version
+# behind kind's and kubebuilder's own newest defaults (1.36). Revisit together
+# with TOOLS.md when KEDA extends support to 1.36+.
+LOCALBIN               := $(CURDIR)/bin
+ENVTEST_K8S_VERSION    ?= 1.35.0
+CONTROLLER_GEN_VERSION ?= v0.20.1
+SETUP_ENVTEST_VERSION  ?= v0.0.0-20260305142021-f9589b9f2b9d
+KIND_NODE_IMAGE        ?= kindest/node:v1.35.5
+KEDA_VERSION           ?= 2.20.1
+LOCALSTACK_IMAGE       ?= localstack/localstack:2026.06.3
+CONTROLLER_GEN         := $(LOCALBIN)/controller-gen
+SETUP_ENVTEST          := $(LOCALBIN)/setup-envtest
 
 $(LOCALBIN):
 	@mkdir -p $(LOCALBIN)
@@ -121,9 +130,10 @@ image: ## Build the worker/operator images with ko
 ##@ Local environment ($0: kind + LocalStack — WR-004)
 
 .PHONY: kind-up
-kind-up: ## Create the local kind cluster
+kind-up: ## Create the local kind cluster (pinned node image — see TOOLS.md)
 	@$(call need,kind,WR-004 sets up the local cluster)
-	kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || kind create cluster --name $(KIND_CLUSTER)
+	kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || \
+	  kind create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE)
 
 .PHONY: kind-down
 kind-down: ## Delete the local kind cluster
@@ -131,11 +141,11 @@ kind-down: ## Delete the local kind cluster
 	kind delete cluster --name $(KIND_CLUSTER) || true
 
 .PHONY: localstack-up
-localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker
+localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker (pinned image — see TOOLS.md)
 	@$(call need,docker,LocalStack runs in a container)
 	docker ps --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$' || \
 	  docker run -d --name $(LOCALSTACK_CONTAINER) -p 4566:4566 \
-	    -e SERVICES=$(LOCALSTACK_SERVICES) localstack/localstack
+	    -e SERVICES=$(LOCALSTACK_SERVICES) $(LOCALSTACK_IMAGE)
 
 .PHONY: localstack-down
 localstack-down: ## Stop and remove LocalStack
@@ -145,7 +155,7 @@ localstack-down: ## Stop and remove LocalStack
 .PHONY: deploy-local
 deploy-local: kind-up localstack-up ## Bring up the full local stack (cluster + LocalStack + operator)
 	@echo "✓ kind + LocalStack are up."
-	@echo "→ TODO: install KEDA (WR-036), then Helm-install the operator (WR-051)."
+	@echo "→ TODO: install KEDA $(KEDA_VERSION) (WR-036), then Helm-install the operator (WR-051)."
 	@echo "  Prefer 'tilt up' once the Tiltfile exists (WR-004) for the live dev loop."
 
 .PHONY: undeploy-local
@@ -155,10 +165,9 @@ undeploy-local: localstack-down kind-down ## Tear down the full local stack
 ##@ Tooling
 
 .PHONY: tools
-tools: $(LOCALBIN) ## Install pinned dev tools into ./bin (controller-gen, setup-envtest)
-	@echo "→ Pin versions in WR-002, then install controller-gen and setup-envtest here."
-	@echo "  e.g. GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@<pinned>"
-	@echo "       GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@<pinned>"
+tools: $(LOCALBIN) ## Install pinned dev tools into ./bin (controller-gen, setup-envtest — see TOOLS.md)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 
 .PHONY: envtest
 envtest: $(LOCALBIN) ## Set up envtest binaries for controller tests (WR-034)
