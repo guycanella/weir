@@ -131,6 +131,22 @@ func parseS3Events(raw []byte) ([]Event, error) {
 			return nil, fmt.Errorf("events: decode key %q: %w", r.S3.Object.Key, err)
 		}
 
+		// encoding/json zero-fills omitted fields, so a record missing an
+		// identity field or carrying a nonsensical size must be rejected
+		// explicitly rather than silently becoming a hollow Event.
+		if r.EventName == "" {
+			return nil, errors.New("events: record missing eventName")
+		}
+		if r.S3.Bucket.Name == "" {
+			return nil, errors.New("events: record missing bucket name")
+		}
+		if key == "" {
+			return nil, errors.New("events: record missing object key")
+		}
+		if r.S3.Object.Size < 0 {
+			return nil, fmt.Errorf("events: record has negative object size %d", r.S3.Object.Size)
+		}
+
 		out = append(out, Event{
 			Bucket:    r.S3.Bucket.Name,
 			Key:       key,

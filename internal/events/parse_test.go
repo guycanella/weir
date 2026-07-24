@@ -326,6 +326,43 @@ func TestParseS3Events_Malformed(t *testing.T) {
 			)),
 		},
 		{
+			// eventName omitted entirely: encoding/json zero-fills it to "", so
+			// without required-field validation the record silently parses to an
+			// Event with an empty EventName. Exercises the missing-eventName
+			// validation branch.
+			name: "record with missing eventName is malformed",
+			raw: snsNotification(t, s3Notification(
+				`{"eventTime":"2026-07-24T12:00:00.000Z","s3":{"bucket":{"name":"uploads"},"object":{"key":"raw/x.mp4","size":1,"eTag":"t","versionId":""}}}`,
+			)),
+		},
+		{
+			// bucket.name omitted entirely: zero-fills to "", leaving an Event a
+			// worker can't GET from. Exercises the missing-bucket validation
+			// branch.
+			name: "record with missing bucket name is malformed",
+			raw: snsNotification(t, s3Notification(
+				`{"eventName":"ObjectCreated:Put","eventTime":"2026-07-24T12:00:00.000Z","s3":{"bucket":{},"object":{"key":"raw/x.mp4","size":1,"eTag":"t","versionId":""}}}`,
+			)),
+		},
+		{
+			// object.key omitted entirely: zero-fills to "", leaving an Event
+			// with no object to fetch. Exercises the missing-key validation
+			// branch.
+			name: "record with missing object key is malformed",
+			raw: snsNotification(t, s3Notification(
+				`{"eventName":"ObjectCreated:Put","eventTime":"2026-07-24T12:00:00.000Z","s3":{"bucket":{"name":"uploads"},"object":{"size":1,"eTag":"t","versionId":""}}}`,
+			)),
+		},
+		{
+			// negative object size (-5): valid JSON and non-zero, but a
+			// nonsensical byte count that must be rejected rather than surfaced
+			// as an Event. Exercises the size-range validation branch.
+			name: "record with negative object size is malformed",
+			raw: snsNotification(t, s3Notification(
+				`{"eventName":"ObjectCreated:Put","eventTime":"2026-07-24T12:00:00.000Z","s3":{"bucket":{"name":"uploads"},"object":{"key":"raw/x.mp4","size":-5,"eTag":"t","versionId":""}}}`,
+			)),
+		},
+		{
 			// A well-formed SNS Notification whose inner payload is arbitrary
 			// JSON: it has no "Records" key AND is not the documented
 			// s3:TestEvent shape (no Event:"s3:TestEvent" marker). Unlike the
