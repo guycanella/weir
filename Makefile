@@ -182,21 +182,28 @@ kind-down: ## Delete the local kind cluster
 # is never used on [cloud] tasks, where real AWS Lambda runs instead — so it
 # never reaches a real account. Treat it like host-root access: don't widen
 # this pattern to other targets without the same justification.
-localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker, reconciling stopped/drifted containers (pinned image — see TOOLS.md)
+localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker, reconciling stopped/drifted containers (pinned image/ports/mounts/env — see TOOLS.md)
 	@$(call need,docker,LocalStack runs in a container)
 	@if docker ps -a --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$'; then \
 	  image=$$(docker inspect --format '{{.Config.Image}}' $(LOCALSTACK_CONTAINER) 2>/dev/null); \
-	  if [ "$$image" != "$(LOCALSTACK_IMAGE)" ]; then \
-	    echo "⚠ '$(LOCALSTACK_CONTAINER)' runs '$$image', pinned image is '$(LOCALSTACK_IMAGE)' — recreating"; \
+	  ports=$$(docker inspect --format '{{json .HostConfig.PortBindings}}' $(LOCALSTACK_CONTAINER) 2>/dev/null); \
+	  binds=$$(docker inspect --format '{{json .HostConfig.Binds}}' $(LOCALSTACK_CONTAINER) 2>/dev/null); \
+	  env=$$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $(LOCALSTACK_CONTAINER) 2>/dev/null); \
+	  want_ports='{"4566/tcp":[{"HostIp":"127.0.0.1","HostPort":"4566"}]}'; \
+	  want_binds='["/var/run/docker.sock:/var/run/docker.sock"]'; \
+	  if [ "$$image" != "$(LOCALSTACK_IMAGE)" ] || [ "$$ports" != "$$want_ports" ] || \
+	     [ "$$binds" != "$$want_binds" ] || \
+	     ! printf '%s\n' "$$env" | grep -qx 'SERVICES=$(LOCALSTACK_SERVICES)'; then \
+	    echo "⚠ '$(LOCALSTACK_CONTAINER)' config drifted from the pin (image, port binding, mounts, or SERVICES) — recreating"; \
 	    docker rm -f $(LOCALSTACK_CONTAINER) >/dev/null; \
 	    docker run -d --name $(LOCALSTACK_CONTAINER) -p 127.0.0.1:4566:4566 \
 	      -e SERVICES=$(LOCALSTACK_SERVICES) \
 	      -v /var/run/docker.sock:/var/run/docker.sock \
 	      $(LOCALSTACK_IMAGE); \
 	  elif [ "$$(docker inspect --format '{{.State.Running}}' $(LOCALSTACK_CONTAINER))" = "true" ]; then \
-	    echo "✓ '$(LOCALSTACK_CONTAINER)' already running on pinned image ($$image)"; \
+	    echo "✓ '$(LOCALSTACK_CONTAINER)' already running on pinned config ($$image)"; \
 	  else \
-	    echo "→ '$(LOCALSTACK_CONTAINER)' exists on pinned image but stopped — starting"; \
+	    echo "→ '$(LOCALSTACK_CONTAINER)' exists on pinned config but stopped — starting"; \
 	    docker start $(LOCALSTACK_CONTAINER) >/dev/null; \
 	  fi; \
 	else \
@@ -212,7 +219,7 @@ localstack-down: ## Stop and remove LocalStack
 	docker rm -f $(LOCALSTACK_CONTAINER) 2>/dev/null || true
 
 .PHONY: hello-up
-hello-up: ## Apply the hello-pod smoke-check manifest and wait for it to be ready
+hello-up: kind-up ## Apply the hello-pod smoke-check manifest and wait for it to be ready
 	@$(call need,kubectl,WR-004 uses kubectl to talk to the kind cluster)
 	@# A just-created kind cluster answers API requests before its namespace
 	@# controller has created the default ServiceAccount pods need — wait
@@ -232,7 +239,7 @@ hello-down: ## Remove the hello-pod smoke-check manifest
 	  kubectl --context kind-$(KIND_CLUSTER) delete -f hack/hello-pod.yaml --ignore-not-found || true
 
 .PHONY: deploy-local
-deploy-local: kind-up localstack-up hello-up ## Bring up the full local stack (cluster + LocalStack + hello pod)
+deploy-local: localstack-up hello-up ## Bring up the full local stack (cluster + LocalStack + hello pod)
 	@echo "✓ kind + LocalStack + hello pod are up."
 	@echo "→ Reach the hello pod: kubectl --context kind-$(KIND_CLUSTER) port-forward svc/hello 8080:80"
 	@echo "→ TODO: install KEDA $(KEDA_VERSION) (WR-036), then Helm-install the operator (WR-051)."

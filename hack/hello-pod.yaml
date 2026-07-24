@@ -19,11 +19,19 @@ metadata:
   labels:
     app: hello
 spec:
+  automountServiceAccountToken: false
   containers:
     - name: hello
       image: nginxinc/nginx-unprivileged:1.29-alpine
       ports:
         - containerPort: 8080
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
       readinessProbe:
         httpGet:
           path: /

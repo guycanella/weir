@@ -38,7 +38,7 @@ The full step-by-step workflow lives in `.claude/commands/start-task.md` and loa
 
 The main thread (orchestrator) drives this loop:
 
-1. **Branch check.** If on `main`, create and switch to the task branch `<type>/WR-NNN/<scope>` (type from the task's nature; scope a kebab-case slug from the task description). If *not* on `main`, stop and ask the human to switch first.
+1. **Branch check.** Read `PROGRESS.md` first. If `WR-NNN` is already `IN PROGRESS` there with a recorded branch, and the current branch matches it, this is a resumed session — continue from wherever the log left off; being off `main` is expected, not an error. Otherwise (a fresh start): if on `main`, create and switch to the task branch `<type>/WR-NNN/<scope>` (type from the task's nature; scope a kebab-case slug from the task description). If on neither `main` nor the recorded resume branch, stop and ask the human to switch first — never silently adopt an unrelated branch as the task branch.
 2. Read the task from `IMPLEMENTATION.md`; verify every `Depends on` is `DONE` in `PROGRESS.md`.
 3. Write `status: IN PROGRESS` (with timestamp + task id + branch) to `PROGRESS.md`. This is the recovery point.
 4. Dispatch to specialists in the right order, each with a self-contained briefing. For `[TDD]` tasks: **tester writes the failing test first**, then the coder implements until green.
@@ -47,7 +47,7 @@ The main thread (orchestrator) drives this loop:
    - *Now (manual mode):* orchestrator pauses and reports "ready for review"; the human runs the external reviewer (Opus/Codex) in another terminal and returns `pode finalizar` (PASS) or findings (FAIL).
    - *Later (automated mode):* orchestrator invokes the external reviewer CLI as a subprocess and parses a JSON verdict `{ "verdict": "PASS|FAIL", "findings": [...] }`. Same gate, different verdict source.
 7. On **PASS**: security agent runs the final scan → orchestrator presents a handoff summary (what was implemented, decisions & deviations, tests, review result) → authors the `WR-NNN:` commit message and the PR title/description and hands them to the human — it never runs `git commit`/`git push` or opens/merges the PR itself → writes `status: IN PROGRESS` with Notes `awaiting merge` to `PROGRESS.md`. Once the human confirms the PR is merged to `main`, orchestrator writes `status: DONE` + summary + which agents acted + which model reviewed.
-8. On **FAIL**: log findings; return to the coder to fix (re-review the diff only). **Cap at 3 iterations**; on the cap, stop and escalate to the human. `high` severity blocks; `low` is a note, not a blocker.
+8. On **FAIL**: log findings, then route each one to the specialist who owns the affected artifact — Go code to the go specialist, CRD/reconcile/RBAC/KEDA/Helm to the kubernetes specialist, `.tf`/LocalStack toggle to the terraform specialist, test-coverage gaps to the tester, security findings to the security specialist, docs/ADR findings to the docs specialist — rather than a single generic "the coder"; a task can span more than one owner. Re-review the diff only. **Cap at 3 iterations**; on the cap, stop and escalate to the human. `high` severity blocks; `low` is a note, not a blocker.
 
 ## Agent roster
 
@@ -90,13 +90,15 @@ Prefer `make` targets over raw commands so behavior is consistent across agents.
   - **No attribution trailer:** never add `Co-authored-by` or any "generated with" line to a commit or PR.
   - **Breaking changes:** append `!` before the colon (`feat!:`) and/or add a `BREAKING CHANGE:` footer.
   - Example:
-    ```
+
+    ```text
     feat(operator): scale workers from queue backlog
 
     Reconcile now reads SQS depth and derives replicas via desiredReplicas().
 
     Refs: WR-031
     ```
+
 - **Branches:** `<type>/WR-NNN/<scope>` — the same Conventional-Commit type as the task's commit, then the task id, then a short kebab-case slug from the task description. E.g. `feat/WR-006/desired-replicas`, `chore/WR-003/makefile`. The orchestrator creates the branch off `main` at the start of `/start-task`.
 - **Go style:** idiomatic Go; **functional core, imperative shell** — pure decision logic separated from I/O (see ADR-003).
 - **Event routing:** `S3 → SNS → SQS` (ADR-001), not EventBridge.

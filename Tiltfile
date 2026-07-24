@@ -32,12 +32,44 @@
 #     clean machine (no kind cluster, no kubeconfig context for it).
 #   - Run `make kind-up` once first (idempotent — see the Makefile), THEN
 #     `tilt up`, and the two entrypoints behave the same from there on.
-#   - Revisit this if/when we adopt Tilt's `k8s_context()`/
-#     `allow_k8s_contexts()` guards to fail fast with a clearer message,
-#     or restructure so kind-cluster creation happens outside Tilt's
-#     parse phase entirely.
+#
+# Context lock (found in external review, WR-004 round 2 — CodeRabbit):
+# `allow_k8s_contexts('kind-$(KIND_CLUSTER)')` below (literally
+# 'kind-weir', matching the Makefile's `KIND_CLUSTER ?= weir` and the
+# `kind-$(KIND_CLUSTER)` context name kind creates) declares the one
+# context this Tiltfile is meant to run against. What this does and does
+# NOT guarantee, per Tilt's own docs for allow_k8s_contexts:
+#   - Tilt already refuses, by default, to apply against a current-context
+#     that doesn't *look* local — names outside its built-in safe patterns
+#     (roughly: kind-*, minikube, docker-desktop, docker-for-desktop, k3d-*,
+#     microk8s, rancher-desktop, colima) are blocked unless explicitly
+#     allowlisted via allow_k8s_contexts. That default heuristic is what
+#     protects against the worst case in CodeRabbit's finding — a real/
+#     cloud context (EKS/GKE/etc) as current-context — independently of
+#     this line, because such names don't match the safe patterns.
+#   - allow_k8s_contexts is an ALLOWLIST addition, not an exclusive lock to
+#     the one name passed in. Declaring 'kind-weir' does not, by itself,
+#     stop Tilt from running against some *other* kind cluster (e.g. a
+#     stray 'kind-other-project' context) or minikube/docker-desktop if
+#     one of those happens to be the current-context instead — those are
+#     already on Tilt's default safe list independent of this declaration.
+#   - Its value here is making the intended context explicit (so a reader
+#     or a future contributor can see exactly which context this project
+#     expects, rather than relying on an implicit "whatever kind-* means
+#     at parse time"), and defense-in-depth if Tilt's default pattern set
+#     ever changes. It is not, on its own, a mechanism for "only kind-weir,
+#     never any other locally-looking cluster."
+#   - Tilt isn't installed in this environment, so this hasn't been
+#     live-verified against a real `tilt up` run — treat the above as a
+#     documentation-accurate best effort from Tilt's public API reference,
+#     not a tested guarantee.
 
 # --- kind cluster + LocalStack -----------------------------------------
+# Restrict Tilt to the context this project actually expects (see the
+# "Context lock" note above) instead of trusting whatever kubeconfig
+# current-context happens to be set at parse time.
+allow_k8s_contexts('kind-weir')
+
 # Tilt doesn't reimplement cluster/container lifecycle here — it shells
 # out to the same `make` targets every other agent and human uses, so
 # there's exactly one place (the Makefile) that knows how to bring these
