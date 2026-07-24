@@ -1,0 +1,48 @@
+name: CI
+
+# Base CI skeleton (WR-005): lint, build, unit tests on every PR and on
+# pushes to main. The kind + LocalStack integration job is out of scope
+# here — that lands in WR-053.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: lint / build / test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          # actions/setup-go has built-in module/build caching — no extra
+          # cache step needed here.
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Install the binary (and let the action manage its own cache)
+          # but skip running the linter here — `make lint` below invokes
+          # it, so the Makefile stays the single source of truth for how
+          # linting is run. Version pinned explicitly (see TOOLS.md) so a
+          # future golangci-lint release can't silently change lint
+          # results with no repository change to explain it.
+          version: v2.12.2
+          install-only: true
+
+      - name: Lint
+        run: make lint
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
