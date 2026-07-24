@@ -37,7 +37,7 @@ CONTROLLER_GEN_VERSION ?= v0.20.1
 SETUP_ENVTEST_VERSION  ?= v0.0.0-20260305142021-f9589b9f2b9d
 KIND_NODE_IMAGE        ?= kindest/node:v1.35.5
 KEDA_VERSION           ?= 2.20.1
-LOCALSTACK_IMAGE       ?= localstack/localstack:2026.06.3
+LOCALSTACK_IMAGE       ?= localstack/localstack:4.14.0
 CONTROLLER_GEN         := $(LOCALBIN)/controller-gen
 SETUP_ENVTEST          := $(LOCALBIN)/setup-envtest
 
@@ -152,10 +152,21 @@ docker-build: ## Build the worker/operator images with ko
 ##@ Local environment ($0: kind + LocalStack — WR-004)
 
 .PHONY: kind-up
-kind-up: ## Create the local kind cluster (pinned node image — see TOOLS.md)
+kind-up: ## Create the local kind cluster, recreating it if its node image drifts from the pin (see TOOLS.md)
 	@$(call need,kind,WR-004 sets up the local cluster)
-	kind get clusters | grep -q '^$(KIND_CLUSTER)$$' || \
-	  kind create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE)
+	@$(call need,docker,kind runs cluster nodes as containers)
+	@if kind get clusters 2>/dev/null | grep -q '^$(KIND_CLUSTER)$$'; then \
+	  running=$$(docker inspect --format '{{.Config.Image}}' $(KIND_CLUSTER)-control-plane 2>/dev/null); \
+	  if [ "$$running" = "$(KIND_NODE_IMAGE)" ]; then \
+	    echo "✓ '$(KIND_CLUSTER)' cluster already runs pinned node image ($$running)"; \
+	  else \
+	    echo "⚠ '$(KIND_CLUSTER)' cluster runs '$$running', pinned image is '$(KIND_NODE_IMAGE)' — recreating"; \
+	    kind delete cluster --name $(KIND_CLUSTER); \
+	    kind create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE); \
+	  fi; \
+	else \
+	  kind create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE); \
+	fi
 
 .PHONY: kind-down
 kind-down: ## Delete the local kind cluster
@@ -163,25 +174,72 @@ kind-down: ## Delete the local kind cluster
 	kind delete cluster --name $(KIND_CLUSTER) || true
 
 .PHONY: localstack-up
-localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker (pinned image — see TOOLS.md)
+# Mounting the host Docker socket below is a deliberate, scoped exception:
+# LocalStack Community's Lambda executor needs it to spin up Lambda execution
+# containers via the host Docker daemon (it can't run containers inside its
+# own container without it). This mirrors LocalStack's own official
+# docker-compose.yml. It is local-dev-only ($0 path, kind + LocalStack) and
+# is never used on [cloud] tasks, where real AWS Lambda runs instead — so it
+# never reaches a real account. Treat it like host-root access: don't widen
+# this pattern to other targets without the same justification.
+localstack-up: ## Start LocalStack (S3/SNS/SQS/Lambda) in Docker, reconciling stopped/drifted containers (pinned image — see TOOLS.md)
 	@$(call need,docker,LocalStack runs in a container)
-	docker ps --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$' || \
-	  docker run -d --name $(LOCALSTACK_CONTAINER) -p 4566:4566 \
-	    -e SERVICES=$(LOCALSTACK_SERVICES) $(LOCALSTACK_IMAGE)
+	@if docker ps -a --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$'; then \
+	  image=$$(docker inspect --format '{{.Config.Image}}' $(LOCALSTACK_CONTAINER) 2>/dev/null); \
+	  if [ "$$image" != "$(LOCALSTACK_IMAGE)" ]; then \
+	    echo "⚠ '$(LOCALSTACK_CONTAINER)' runs '$$image', pinned image is '$(LOCALSTACK_IMAGE)' — recreating"; \
+	    docker rm -f $(LOCALSTACK_CONTAINER) >/dev/null; \
+	    docker run -d --name $(LOCALSTACK_CONTAINER) -p 127.0.0.1:4566:4566 \
+	      -e SERVICES=$(LOCALSTACK_SERVICES) \
+	      -v /var/run/docker.sock:/var/run/docker.sock \
+	      $(LOCALSTACK_IMAGE); \
+	  elif [ "$$(docker inspect --format '{{.State.Running}}' $(LOCALSTACK_CONTAINER))" = "true" ]; then \
+	    echo "✓ '$(LOCALSTACK_CONTAINER)' already running on pinned image ($$image)"; \
+	  else \
+	    echo "→ '$(LOCALSTACK_CONTAINER)' exists on pinned image but stopped — starting"; \
+	    docker start $(LOCALSTACK_CONTAINER) >/dev/null; \
+	  fi; \
+	else \
+	  docker run -d --name $(LOCALSTACK_CONTAINER) -p 127.0.0.1:4566:4566 \
+	    -e SERVICES=$(LOCALSTACK_SERVICES) \
+	    -v /var/run/docker.sock:/var/run/docker.sock \
+	    $(LOCALSTACK_IMAGE); \
+	fi
 
 .PHONY: localstack-down
 localstack-down: ## Stop and remove LocalStack
 	@$(call need,docker,LocalStack runs in a container)
 	docker rm -f $(LOCALSTACK_CONTAINER) 2>/dev/null || true
 
+.PHONY: hello-up
+hello-up: ## Apply the hello-pod smoke-check manifest and wait for it to be ready
+	@$(call need,kubectl,WR-004 uses kubectl to talk to the kind cluster)
+	@# A just-created kind cluster answers API requests before its namespace
+	@# controller has created the default ServiceAccount pods need — wait
+	@# for it so `apply` right after `kind-up` doesn't race and fail.
+	@for i in $$(seq 1 30); do \
+	  kubectl --context kind-$(KIND_CLUSTER) get serviceaccount default >/dev/null 2>&1 && exit 0; \
+	  sleep 2; \
+	done; \
+	echo "✗ timed out waiting for the default ServiceAccount"; exit 1
+	kubectl --context kind-$(KIND_CLUSTER) apply -f hack/hello-pod.yaml
+	kubectl --context kind-$(KIND_CLUSTER) wait --for=condition=Ready pod/hello --timeout=90s
+
+.PHONY: hello-down
+hello-down: ## Remove the hello-pod smoke-check manifest
+	@$(call need,kubectl,WR-004 uses kubectl to talk to the kind cluster)
+	@kind get clusters 2>/dev/null | grep -q '^$(KIND_CLUSTER)$$' && \
+	  kubectl --context kind-$(KIND_CLUSTER) delete -f hack/hello-pod.yaml --ignore-not-found || true
+
 .PHONY: deploy-local
-deploy-local: kind-up localstack-up ## Bring up the full local stack (cluster + LocalStack + operator)
-	@echo "✓ kind + LocalStack are up."
+deploy-local: kind-up localstack-up hello-up ## Bring up the full local stack (cluster + LocalStack + hello pod)
+	@echo "✓ kind + LocalStack + hello pod are up."
+	@echo "→ Reach the hello pod: kubectl --context kind-$(KIND_CLUSTER) port-forward svc/hello 8080:80"
 	@echo "→ TODO: install KEDA $(KEDA_VERSION) (WR-036), then Helm-install the operator (WR-051)."
-	@echo "  Prefer 'tilt up' once the Tiltfile exists (WR-004) for the live dev loop."
+	@echo "  Prefer 'tilt up' (see Tiltfile) for the live dev loop — same scope today, extended in WR-011+/WR-026/WR-051."
 
 .PHONY: undeploy-local
-undeploy-local: localstack-down kind-down ## Tear down the full local stack
+undeploy-local: hello-down localstack-down kind-down ## Tear down the full local stack
 	@echo "✓ Local stack torn down."
 
 ##@ Tooling

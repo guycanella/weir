@@ -1,0 +1,52 @@
+# hack/hello-pod.yaml — WR-004 smoke check
+#
+# Minimal Pod + Service used only to prove the local kind cluster is up and
+# reachable ("a hello pod reachable" in WR-004's Done-when). It is NOT the
+# operator or worker — those land in WR-011+ / WR-026 and get their own
+# manifests under config/ (kubebuilder-generated) once that code exists.
+#
+# Reachability: rather than wiring kind's extraPortMappings (a NodePort ->
+# host-port mapping baked into cluster creation), this uses a plain
+# ClusterIP Service reached via `kubectl port-forward`. That's the simpler
+# of the two options for a one-off smoke check and needs no kind cluster
+# config file; extraPortMappings would only earn its complexity once
+# something needs a stable host port across cluster recreations (e.g. a
+# real ingress path), which nothing does yet. Revisit if/when that changes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  labels:
+    app: hello
+spec:
+  containers:
+    - name: hello
+      image: nginxinc/nginx-unprivileged:1.29-alpine
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 8080
+        initialDelaySeconds: 1
+        periodSeconds: 2
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  labels:
+    app: hello
+spec:
+  selector:
+    app: hello
+  ports:
+    - port: 80
+      targetPort: 8080

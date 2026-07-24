@@ -12,11 +12,11 @@ A Kubernetes operator (Go) for event-driven processing pipelines. You declare a 
 |------|------|-----------|
 | `DOCUMENTATION.md` | The **why** — design, architecture, ADRs, stack rationale. | Humans + docs agent. Decisions become ADRs here. |
 | `IMPLEMENTATION.md` | The **what** — the 66 `WR-NNN` tasks, dependencies, Definition of Done. Stable spec. | Rarely edited (only to add/reshape tasks). |
-| `PROGRESS.md` | The **status** — execution diary: status board + append-only log. | **Orchestrator only.** |
+| `PROGRESS.md` | The **status** — execution diary: status board + append-only log. | **Orchestrator only** (the main thread running a task). |
 
 ## Golden rules (non-negotiable)
 
-1. **Only the orchestrator writes `PROGRESS.md`.** Specialist agents return results; the orchestrator is the sole scribe. This is enforced by tool grants in the agent definitions — specialists are not given write access to `PROGRESS.md`.
+1. **Only the orchestrator writes `PROGRESS.md`.** Specialist agents return results; the orchestrator (the main thread running the task) is the sole scribe. This is enforced by **instruction**, not tool grants: coders legitimately need write access to files, so the tools field can't scope out a single file — specialists are told to return results and never touch `PROGRESS.md`.
 2. **Every unit of work maps to a `WR-NNN` task.** Commits follow **Conventional Commits** with the task id in a `Refs: WR-NNN` footer (see Conventions). Check a task's `Depends on` in `PROGRESS.md` before starting it.
 3. **TDD where it belongs (ADR-003).** Write tests first for the pure decision core and for non-trivial reconciler logic. Do *not* force TDD on IaC, framework glue, or AWS wiring — those get integration tests.
 4. **Local-first, $0 by default.** All routine work runs on kind + LocalStack. Anything touching real AWS is a `[cloud]` task and **requires explicit human confirmation** before running (cloud commands are permission-gated to `ask`).
@@ -24,27 +24,38 @@ A Kubernetes operator (Go) for event-driven processing pipelines. You declare a 
 6. **MVP first, resist over-engineering.** Ship the walking skeleton before stretch goals. Cutting scope on purpose is correct; document what was cut and why.
 7. **Decisions vs blockers.** An architecture decision that changes the design → promote to a new ADR in `DOCUMENTATION.md` *and* log it in `PROGRESS.md`. A mere execution blocker (a version clash, a flaky tool) → log in `PROGRESS.md` only.
 
+## Orchestration model — who dispatches whom
+
+Task delivery is driven by the **main thread** (this session) via `/start-task WR-NNN`, **not** by a subagent. This is deliberate and load-bearing: Claude Code subagents are **one level deep** — a subagent cannot spawn another subagent. Only the main thread can dispatch. So the fan-out to specialists must happen from here.
+
+- The **main thread is the orchestrator**: it creates the branch, dispatches specialists, runs the review gate, owns `PROGRESS.md`, and authors the commit/PR hand-off.
+- The specialists in `.claude/agents/` are **leaf subagents**: the main thread dispatches them; they never dispatch each other.
+- A subagent only receives the **prompt string** as its context — it does not see this conversation, files already read, or decisions already made. So **every dispatch must be a self-contained briefing**: task id, `Done when`, branch name, file paths, relevant ADRs, and any decision made this session that affects the specialist's work. Over-brief rather than under-brief.
+
+The full step-by-step workflow lives in `.claude/commands/start-task.md` and loads only when you run the command, so it doesn't weigh on ordinary sessions.
+
 ## The task workflow — `/start-task WR-NNN`
 
-The orchestrator drives this loop:
+The main thread (orchestrator) drives this loop:
 
-1. Read the task from `IMPLEMENTATION.md`; verify every `Depends on` is `DONE` in `PROGRESS.md`.
-2. Write `status: IN PROGRESS` (with timestamp + task id) to `PROGRESS.md`. This is the recovery point.
-3. Dispatch to specialists in the right order. For `[TDD]` tasks: **tester writes the failing test first**, then the coder implements until green.
-4. Internal review pass (reviewer agent) against the ADRs and conventions.
-5. **Review gate — wait for a verdict before finalizing.**
+1. **Branch check.** If on `main`, create and switch to the task branch `<type>/WR-NNN/<scope>` (type from the task's nature; scope a kebab-case slug from the task description). If *not* on `main`, stop and ask the human to switch first.
+2. Read the task from `IMPLEMENTATION.md`; verify every `Depends on` is `DONE` in `PROGRESS.md`.
+3. Write `status: IN PROGRESS` (with timestamp + task id + branch) to `PROGRESS.md`. This is the recovery point.
+4. Dispatch to specialists in the right order, each with a self-contained briefing. For `[TDD]` tasks: **tester writes the failing test first**, then the coder implements until green.
+5. Internal review pass (reviewer agent) against the ADRs and conventions.
+6. **Review gate — wait for a verdict before finalizing.**
    - *Now (manual mode):* orchestrator pauses and reports "ready for review"; the human runs the external reviewer (Opus/Codex) in another terminal and returns `pode finalizar` (PASS) or findings (FAIL).
    - *Later (automated mode):* orchestrator invokes the external reviewer CLI as a subprocess and parses a JSON verdict `{ "verdict": "PASS|FAIL", "findings": [...] }`. Same gate, different verdict source.
-6. On **PASS**: security agent runs the final scan → orchestrator authors the `WR-NNN:` commit message and the PR title/description and hands them to the human — it never runs `git commit`/`git push` or opens/merges the PR itself → writes `status: IN PROGRESS` with Notes `awaiting merge` to `PROGRESS.md`. Once the human confirms the PR is merged to `main`, orchestrator writes `status: DONE` + summary + which agents acted + which model reviewed.
-7. On **FAIL**: log findings; return to the coder to fix (re-review the diff only). **Cap at 3 iterations**; on the cap, stop and escalate to the human. `high` severity blocks; `low` is a note, not a blocker.
+7. On **PASS**: security agent runs the final scan → orchestrator presents a handoff summary (what was implemented, decisions & deviations, tests, review result) → authors the `WR-NNN:` commit message and the PR title/description and hands them to the human — it never runs `git commit`/`git push` or opens/merges the PR itself → writes `status: IN PROGRESS` with Notes `awaiting merge` to `PROGRESS.md`. Once the human confirms the PR is merged to `main`, orchestrator writes `status: DONE` + summary + which agents acted + which model reviewed.
+8. On **FAIL**: log findings; return to the coder to fix (re-review the diff only). **Cap at 3 iterations**; on the cap, stop and escalate to the human. `high` severity blocks; `low` is a note, not a blocker.
 
 ## Agent roster
 
-Main thread = **orchestrator**. Specialists are subagents (`.claude/agents/`), each with a restricted tool set and its own model tier. The external reviewer is a separate CLI (not a subagent).
+Main thread = **orchestrator** (it dispatches; it is not itself a subagent). Specialists are subagents (`.claude/agents/`), each with a restricted tool set and its own model tier. The external reviewer is a separate CLI (not a subagent).
 
 | Agent | Role | Model tier |
 |-------|------|-----------|
-| orchestrator | routes tasks, owns `PROGRESS.md`, runs the loop; creates the task branch but never commits/pushes/opens or merges PRs — authors that text for the human | capable (e.g. Sonnet 5) |
+| orchestrator (main thread) | routes tasks, owns `PROGRESS.md`, runs the loop; creates the task branch but never commits/pushes/opens or merges PRs — authors that text for the human | the session model (Sonnet 5) |
 | tester | writes tests first (TDD); runs the suite | robust (test design is hard) |
 | go | all Go code (operator, worker, loadgen, SDK) | lighter coder (Sonnet 5 / Gemini Flash) |
 | kubernetes | CRD, reconcile, RBAC, KEDA, Helm | lighter coder |
@@ -55,7 +66,7 @@ Main thread = **orchestrator**. Specialists are subagents (`.claude/agents/`), e
 | docs | keeps the triad in sync; drafts ADRs | lighter |
 | **external reviewer (CLI)** | cross-model code review gate (Opus 4.8 / Codex) | most robust |
 
-Start with the minimum roster that closes a `[TDD][local]` task end-to-end — orchestrator, tester, go, reviewer, docs — and add the rest as the phases demand them.
+Start with the minimum roster that closes a `[TDD][local]` task end-to-end — tester, go, reviewer, docs — and add the rest as the phases demand them.
 
 ## Commands
 
@@ -76,6 +87,7 @@ Prefer `make` targets over raw commands so behavior is consistent across agents.
 - **Commits:** follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/). Format: `<type>[optional scope]: <description>`, with an optional body and footers.
   - **Types:** `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`, `ci`, `chore`. Scope is an optional noun for the area, e.g. `feat(operator):`, `test(scaling):`.
   - **Task traceability:** put the task id in a footer — `Refs: WR-NNN` (git-trailer style). Keep the description imperative and lowercase; no trailing period.
+  - **No attribution trailer:** never add `Co-authored-by` or any "generated with" line to a commit or PR.
   - **Breaking changes:** append `!` before the colon (`feat!:`) and/or add a `BREAKING CHANGE:` footer.
   - Example:
     ```
@@ -85,7 +97,7 @@ Prefer `make` targets over raw commands so behavior is consistent across agents.
 
     Refs: WR-031
     ```
-- **Branches:** `wr-NNN-short-slug`.
+- **Branches:** `<type>/WR-NNN/<scope>` — the same Conventional-Commit type as the task's commit, then the task id, then a short kebab-case slug from the task description. E.g. `feat/WR-006/desired-replicas`, `chore/WR-003/makefile`. The orchestrator creates the branch off `main` at the start of `/start-task`.
 - **Go style:** idiomatic Go; **functional core, imperative shell** — pure decision logic separated from I/O (see ADR-003).
 - **Event routing:** `S3 → SNS → SQS` (ADR-001), not EventBridge.
 - **Scaling:** backlog-driven via KEDA, scale-to-zero (ADR-002).
