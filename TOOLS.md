@@ -1,0 +1,57 @@
+# Weir — Pinned Toolchain & Version Matrix
+
+This file is the single source of truth for **which versions of the toolchain are mutually
+compatible** for local development (kind + LocalStack, $0). It exists because kubebuilder,
+controller-runtime, KEDA, and the Kubernetes/envtest binaries evolve independently and each
+has its own compatibility window — see CLAUDE.md's "Version discipline" note and
+DOCUMENTATION.md's version caveat. **Consult this file before scaffolding or upgrading;
+don't guess versions from memory (WR-002).**
+
+Last verified: 2026-07-23 (WR-002), against upstream release notes at that date.
+
+## The pinned set
+
+| Tool | Pinned version | Why this one |
+|------|-----------------|--------------|
+| Go | `1.26.5` | Matches the installed toolchain (`go version` → `go1.26.5`) recorded in `go.mod` since WR-001. New enough for every tool below; Go's backward compatibility means a newer patch toolchain building against an older `go` directive is safe. |
+| kubebuilder | `v4.14.0` | Last release on the controller-runtime v0.23.x / Kubernetes 1.35 generation, before v4.15.0 moved to Kubernetes 1.36 support. Picked over the newer v4.15.0 specifically to stay inside KEDA's tested window (below). |
+| controller-runtime | `v0.23.3` | The version kubebuilder v4.14.0 scaffolds; built against `k8s.io/*` v1.35. Latest patch on the v0.23 line. |
+| controller-tools (`controller-gen`) | `v0.20.1` | Paired with the same v1.35 generation (`envtest-v1.35.0` was tagged the same day as `controller-tools v0.20.0`); v0.20.1 is the latest bugfix patch on that line. |
+| `setup-envtest` (the installer binary) | `v0.0.0-20260305142021-f9589b9f2b9d` (exact pseudo-version, not the `release-0.23` branch) | `setup-envtest` has no semver tags — it's installed off a release branch, which is mutable. Pinning the exact pseudo-version `go install` resolved (the commit on `release-0.23` at pin time) makes `make tools` reproducible: re-running it later installs the same code, not whatever `release-0.23` has moved to. Bump deliberately, not implicitly. |
+| Kubernetes / envtest | `1.35.0` | `setup-envtest use 1.35.0` — matches controller-runtime v0.23.3's tested API version, and sits inside KEDA's supported window. |
+| KEDA | `2.20.1` (Helm chart) | Latest KEDA release. Its documented compatibility window is Kubernetes **v1.33–v1.35** (N-2 tested policy, https://keda.sh/docs/2.20/operate/cluster/) — this is the constraint that drove every other pin below Kubernetes 1.36. |
+| kind | `v0.32.0` | Already installed locally (`kind version` → `v0.32.0 go1.26.5`). Its *default* node image is `kindest/node:v1.36.1`, which is **outside** KEDA's tested window — see the override below. |
+| kind node image | `kindest/node:v1.35.5` (tag, not digest — see note) | Overrides kind v0.32.0's default (1.36.1) so the local cluster's control-plane version matches the Kubernetes 1.35 generation everything else above is pinned to. |
+| LocalStack | `localstack/localstack:2026.06.3` | Latest stable calendar-versioned release at pin time (LocalStack switched to `YYYY.MM.patch` versioning in 2026). Community edition; covers S3, SNS, SQS, Lambda per DOCUMENTATION.md. |
+
+## Why Kubernetes 1.35, not the newest 1.36
+
+kind's newest default and kubebuilder's newest release both moved to Kubernetes 1.36 shortly
+before this pin was made. KEDA 2.20 — the autoscaler ADR-002 depends on — only documents
+support up to Kubernetes 1.35 (N-2 from whatever is current for KEDA). Rather than run a
+cluster version KEDA doesn't claim to support, this pin holds the whole stack one Kubernetes
+minor version back, on 1.35, where kubebuilder, controller-runtime, controller-tools/envtest,
+and KEDA are all confirmed compatible. Revisit this pin (and this file) when KEDA extends its
+tested window to 1.36+ — likely around the task that installs KEDA (WR-036) or later.
+
+## Deliberately deferred (not over-engineering this file)
+
+- **Digest-pinning the kind node image** (`kindest/node:v1.35.5@sha256:...`) is kind's own
+  recommended best practice for reproducibility, but the digest wasn't hand-verified against
+  a trusted source at pin time. Tag-pinning (`v1.35.5`) is good enough for local dev now;
+  add the digest when CI hardening lands (WR-005) if reproducibility issues show up.
+- **controller-gen / setup-envtest exact `go install` tags** are recorded here and wired into
+  the Makefile (`make tools`), but will be reconciled against whatever `go.mod` kubebuilder
+  v4.14.0 actually scaffolds in WR-011 — kubebuilder is the source of truth for its own
+  generated `go.mod`, this file is the pre-scaffold plan.
+- **ARM64 LocalStack image variant** isn't pinned separately; Docker Hub resolves the
+  multi-arch manifest for `2026.06.3` automatically.
+
+## Where this is wired
+
+- `Makefile`: `ENVTEST_K8S_VERSION`, `KIND_NODE_IMAGE`, `CONTROLLER_GEN_VERSION`,
+  `SETUP_ENVTEST_VERSION`, `KEDA_VERSION`, `LOCALSTACK_IMAGE` variables reference the pins
+  above; `make tools`, `make envtest`, `make kind-up`, and `make localstack-up` consume them.
+- kubebuilder itself (`v4.14.0`) is not a Makefile variable — it is a one-time scaffolding
+  tool invoked directly (`kubebuilder init` / `kubebuilder create api`) in WR-011 onward, not
+  something `make` installs or runs repeatedly.

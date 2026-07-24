@@ -35,7 +35,7 @@ The orchestrator drives this loop:
 5. **Review gate — wait for a verdict before finalizing.**
    - *Now (manual mode):* orchestrator pauses and reports "ready for review"; the human runs the external reviewer (Opus/Codex) in another terminal and returns `pode finalizar` (PASS) or findings (FAIL).
    - *Later (automated mode):* orchestrator invokes the external reviewer CLI as a subprocess and parses a JSON verdict `{ "verdict": "PASS|FAIL", "findings": [...] }`. Same gate, different verdict source.
-6. On **PASS**: security agent runs the final scan → orchestrator creates the `WR-NNN:` commit and opens the PR → writes `status: DONE` + summary + which model reviewed, to `PROGRESS.md`.
+6. On **PASS**: security agent runs the final scan → orchestrator authors the `WR-NNN:` commit message and the PR title/description and hands them to the human — it never runs `git commit`/`git push` or opens/merges the PR itself → writes `status: IN PROGRESS` with Notes `awaiting merge` to `PROGRESS.md`. Once the human confirms the PR is merged to `main`, orchestrator writes `status: DONE` + summary + which agents acted + which model reviewed.
 7. On **FAIL**: log findings; return to the coder to fix (re-review the diff only). **Cap at 3 iterations**; on the cap, stop and escalate to the human. `high` severity blocks; `low` is a note, not a blocker.
 
 ## Agent roster
@@ -44,7 +44,7 @@ Main thread = **orchestrator**. Specialists are subagents (`.claude/agents/`), e
 
 | Agent | Role | Model tier |
 |-------|------|-----------|
-| orchestrator | routes tasks, owns git + `PROGRESS.md`, runs the loop | capable (e.g. Sonnet 5) |
+| orchestrator | routes tasks, owns `PROGRESS.md`, runs the loop; creates the task branch but never commits/pushes/opens or merges PRs — authors that text for the human | capable (e.g. Sonnet 5) |
 | tester | writes tests first (TDD); runs the suite | robust (test design is hard) |
 | go | all Go code (operator, worker, loadgen, SDK) | lighter coder (Sonnet 5 / Gemini Flash) |
 | kubernetes | CRD, reconcile, RBAC, KEDA, Helm | lighter coder |
