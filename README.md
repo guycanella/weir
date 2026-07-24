@@ -23,7 +23,11 @@ of two deliberately different patterns:
   when the thing they depend on doesn't exist yet on this empty skeleton (no Go packages,
   no `controller-gen`/kubebuilder types, no `cover.out`), they print what's missing and
   which task lands it, then **exit 0**. That keeps CI/local runs green on a repo that
-  hasn't reached that phase yet.
+  hasn't reached that phase yet. This no-op path only fires on a *successful, genuinely
+  empty* discovery — e.g. `make test` first checks that `go list ./...` itself succeeded
+  before treating an empty package list as "nothing to test yet"; a malformed `go.mod`,
+  build errors, or a missing Go toolchain still fail loudly with a nonzero exit, they are
+  never swallowed into the no-op message.
 - **Hard requirement guards** (`make lint`, `make docker-build`, `make test-integration`):
   when a required tool or service is missing, they **fail loudly** (nonzero exit) with an
   actionable message telling you what to install/start and which task wires it up for real.
@@ -36,7 +40,7 @@ one applies to each target.
 | Target | What it does | Status today |
 |--------|--------------|---------------|
 | `make build` | `go build ./...` — compiles every package. | Works now. |
-| `make test` | `go test ./... -race -coverprofile=cover.out` — the fast unit-test / TDD inner loop. | Phase-gated no-op stub — exits 0 while the module has zero packages, so CI stays green on the empty skeleton. |
+| `make test` | `go test ./... -race -coverprofile=cover.out` — the fast unit-test / TDD inner loop. | Phase-gated no-op stub — exits 0 only when `go list ./...` *succeeds* with zero packages, so CI stays green on the empty skeleton; a broken `go.mod`/build error from `go list` still fails loudly with a nonzero exit instead of being masked as a no-op. |
 | `make cover` | `go tool cover -func=cover.out` — coverage summary from the last `make test` run. | Phase-gated no-op stub — exits 0 with a message if `cover.out` doesn't exist yet (i.e. before any packages exist to test). |
 | `make test-integration` | Runs `-tags=integration` tests against kind + LocalStack. | Hard requirement guard — fails loudly if `kind` isn't installed or LocalStack isn't running (needs `make deploy-local`); fully exercised once WR-004 lands. |
 | `make lint` | Runs `golangci-lint run`. | Hard requirement guard — fails loudly if `golangci-lint` isn't on `PATH` locally; installed separately in CI (WR-005). |

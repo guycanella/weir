@@ -91,7 +91,12 @@ clean: ## Remove build/test artifacts
 
 .PHONY: test
 test: ## Run fast unit tests (race + coverage) — the TDD inner loop
-	@pkgs=$$(go list ./... 2>/dev/null); \
+	@pkgs=$$(go list ./... 2>/dev/null); status=$$?; \
+	if [ $$status -ne 0 ]; then \
+	  echo "✗ 'go list ./...' failed — fix go.mod/build errors before running tests."; \
+	  go list ./... 1>/dev/null; \
+	  exit $$status; \
+	fi; \
 	if [ -z "$$pkgs" ]; then \
 	  echo "→ no Go packages yet — nothing to test (expected on the empty skeleton)."; \
 	  exit 0; \
