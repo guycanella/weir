@@ -53,14 +53,16 @@ If you leave something out, the specialist starts blind. Over-brief rather than 
 
 ### 0 — Branch check
 
+- **Bootstrap `PROGRESS.md` if absent:** it's gitignored, so a fresh clone won't have it. If it doesn't exist, create it now with the standard status-board + log skeleton (see the PROGRESS.md write protocol below) before doing anything else in this step. Treat this as an empty progress state — no task in progress, nothing done yet.
 - Run `git rev-parse --abbrev-ref HEAD` to see the current branch, and read `PROGRESS.md`.
-- **Resume case:** if `PROGRESS.md` already records `$ARGUMENTS` as `IN PROGRESS` with a branch name, and the current branch matches that recorded name, this is a resumed session — skip branch creation and continue from wherever the log left off. Being off `main` is expected here, not an error.
+- **Resume case:** if `PROGRESS.md` already records `$ARGUMENTS` as `IN PROGRESS` with a branch name, the current branch matches that recorded name, **and** the row's Notes are anything other than `awaiting merge`, this is a resumed mid-work session — skip branch creation and continue from wherever the log left off. Being off `main` is expected here, not an error.
+- **Awaiting-merge case:** if `PROGRESS.md` records `$ARGUMENTS` as `IN PROGRESS` with Notes `awaiting merge`, the work is already implemented and prepared — do **not** redispatch specialists or restart the workflow. Go straight to step 7: ask the human whether the PR has been merged, and stop there until they confirm.
 - **New-task case** (no matching in-progress entry for `$ARGUMENTS`):
   - **If on `main`:** create and switch to the task branch, then proceed. Name it `<type>/WR-NNN/<scope>`:
     - `<type>` = the Conventional-Commit type for this task (`feat`, `fix`, `chore`, `docs`, `refactor`, `perf`, `build`, `ci`), from the nature of the task.
     - `<scope>` = short kebab-case slug from the task's **description** in `IMPLEMENTATION.md` (e.g. WR-006 "implement desiredReplicas()" → `feat/WR-006/desired-replicas`).
     - Use `git switch -c <type>/WR-NNN/<scope>`. Confirm the branch name to the human.
-  - **If not on `main`, and not the resume case above:** stop. Tell the human: *"Not on main and not on `$ARGUMENTS`'s recorded branch (currently on `<branch>`). Please switch to main to start fresh, or to the recorded branch to resume."* Do not switch branches yourself, and do not silently adopt an unrelated branch as the task branch. Wait.
+  - **If not on `main`, and not the resume or awaiting-merge case above:** stop. Tell the human: *"Not on main and not on `$ARGUMENTS`'s recorded branch (currently on `<branch>`). Please switch to main to start fresh, or to the recorded branch to resume."* Do not switch branches yourself, and do not silently adopt an unrelated branch as the task branch. Wait.
 
 ### 1 — Load & validate
 
@@ -99,7 +101,7 @@ Route by the nature of the work; independent steps in parallel, dependent steps 
 ### 5 — Review gate (wait for a verdict)
 
 - **Manual mode (default):** pause and report to the human: *"WR-NNN ready for review — diff summary: …"*. Wait. The human runs the external reviewer (Opus/Codex) in another terminal and returns **PASS** (e.g. "pode finalizar") or **findings**. Do not proceed on your own.
-- Gate rules: `high` severity **blocks**; `low` is a note. On findings, log them in `PROGRESS.md`, then route each finding to the specialist who owns that artifact — same ownership list as step 3/4 (Go → julia, CRD/reconcile/RBAC/KEDA/Helm → john, `.tf`/LocalStack toggle → viktor, tests → flynn, security → lisa, docs/ADRs → bruce) — and re-run the gate on the diff only. **Cap at 3 iterations**, then stop and escalate to the human.
+- Gate rules: `high` severity **blocks** and is always routed for a fix; `medium` is normally worth fixing too (established project practice), at your judgment. `low` is a note only — log it in `PROGRESS.md` and move on; never dispatch a specialist or re-run the gate just for a low finding. For blocking findings, log them in `PROGRESS.md`, then route each to the specialist who owns that artifact — same ownership list as step 3/4 (Go → julia, CRD/reconcile/RBAC/KEDA/Helm → john, `.tf`/LocalStack toggle → viktor, tests → flynn, security → lisa, docs/ADRs → bruce) — and re-run the gate on the diff only. **Cap at 3 iterations**, then stop and escalate to the human.
 
 ### 6 — Prepare finalization (only on PASS) — hand off, do NOT execute
 
