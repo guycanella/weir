@@ -76,6 +76,16 @@ vet: ## Run go vet
 .PHONY: lint
 lint: ## Run golangci-lint
 	@$(call need,golangci-lint,install: https://golangci-lint.run/welcome/install/)
+	@pkgs=$$(go list ./... 2>/dev/null); status=$$?; \
+	if [ $$status -ne 0 ]; then \
+	  echo "✗ 'go list ./...' failed — fix go.mod/build errors before linting."; \
+	  go list ./... 1>/dev/null; \
+	  exit $$status; \
+	fi; \
+	if [ -z "$$pkgs" ]; then \
+	  echo "→ no Go packages yet — nothing to lint (expected on the empty skeleton)."; \
+	  exit 0; \
+	fi; \
 	golangci-lint run
 
 .PHONY: build
