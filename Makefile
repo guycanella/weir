@@ -91,10 +91,24 @@ clean: ## Remove build/test artifacts
 
 .PHONY: test
 test: ## Run fast unit tests (race + coverage) — the TDD inner loop
+	@pkgs=$$(go list ./... 2>/dev/null); status=$$?; \
+	if [ $$status -ne 0 ]; then \
+	  echo "✗ 'go list ./...' failed — fix go.mod/build errors before running tests."; \
+	  go list ./... 1>/dev/null; \
+	  exit $$status; \
+	fi; \
+	if [ -z "$$pkgs" ]; then \
+	  echo "→ no Go packages yet — nothing to test (expected on the empty skeleton)."; \
+	  exit 0; \
+	fi; \
 	go test ./... -race -coverprofile=cover.out
 
 .PHONY: cover
 cover: test ## Show coverage summary
+	@if [ ! -f cover.out ]; then \
+	  echo "→ no cover.out yet — run 'make test' once packages exist."; \
+	  exit 0; \
+	fi; \
 	go tool cover -func=cover.out
 
 .PHONY: test-integration
@@ -109,21 +123,29 @@ test-integration: ## Run kind + LocalStack integration tests (needs deploy-local
 
 .PHONY: manifests
 manifests: ## Generate CRDs + RBAC manifests
-	@test -x $(CONTROLLER_GEN) || { \
-	  echo "→ controller-gen not installed yet. Run 'make tools' (added in WR-011)."; exit 0; }
+	@if [ ! -x $(CONTROLLER_GEN) ]; then \
+	  echo "→ controller-gen not installed yet. Run 'make tools' (added in WR-011)."; \
+	  exit 0; \
+	fi; \
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook \
 	  paths="./..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
 generate: ## Generate deepcopy code
-	@test -x $(CONTROLLER_GEN) || { \
-	  echo "→ controller-gen not installed yet. Run 'make tools' (added in WR-011)."; exit 0; }
+	@if [ ! -x $(CONTROLLER_GEN) ]; then \
+	  echo "→ controller-gen not installed yet. Run 'make tools' (added in WR-011)."; \
+	  exit 0; \
+	fi; \
+	if [ ! -f hack/boilerplate.go.txt ]; then \
+	  echo "→ hack/boilerplate.go.txt not scaffolded yet — lands with kubebuilder init (WR-011)."; \
+	  exit 0; \
+	fi; \
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 ##@ Images (ko — WR-026)
 
-.PHONY: image
-image: ## Build the worker/operator images with ko
+.PHONY: docker-build
+docker-build: ## Build the worker/operator images with ko
 	@$(call need,ko,WR-026 introduces ko for image builds)
 	KO_DOCKER_REPO=$(IMG_WORKER) ko build ./cmd/worker --local
 
