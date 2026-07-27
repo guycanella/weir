@@ -25,4 +25,3 @@ resources:
 - processingpipeline_admin_role.yaml
 - processingpipeline_editor_role.yaml
 - processingpipeline_viewer_role.yaml
-

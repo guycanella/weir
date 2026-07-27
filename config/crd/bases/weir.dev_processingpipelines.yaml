@@ -116,7 +116,8 @@ spec:
               backlog:
                 description: |-
                   backlog is the last observed number of undelivered messages on the
-                  pipeline's queue, surfaced as the BACKLOG printer column.
+                  pipeline's queue (WR-013 surfaces this as the BACKLOG printer
+                  column).
                 format: int32
                 minimum: 0
                 type: integer
@@ -191,8 +192,8 @@ spec:
                 x-kubernetes-list-type: map
               phase:
                 description: |-
-                  phase is a coarse summary of the pipeline's reconcile lifecycle,
-                  surfaced as the STATUS printer column.
+                  phase is a coarse summary of the pipeline's reconcile lifecycle
+                  (WR-013 surfaces this as the STATUS printer column).
                 enum:
                 - Pending
                 - Provisioning
@@ -201,8 +202,8 @@ spec:
                 type: string
               replicas:
                 description: |-
-                  replicas is the last observed number of worker replicas, surfaced
-                  as the REPLICAS printer column.
+                  replicas is the last observed number of worker replicas (WR-013
+                  surfaces this as the REPLICAS printer column).
                 format: int32
                 minimum: 0
                 type: integer

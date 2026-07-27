@@ -126,20 +126,21 @@ const (
 
 // ProcessingPipelineStatus defines the observed state of ProcessingPipeline.
 type ProcessingPipelineStatus struct {
-	// phase is a coarse summary of the pipeline's reconcile lifecycle,
-	// surfaced as the STATUS printer column.
+	// phase is a coarse summary of the pipeline's reconcile lifecycle
+	// (WR-013 surfaces this as the STATUS printer column).
 	// +kubebuilder:validation:Enum=Pending;Provisioning;Running;Failed
 	// +optional
 	Phase ProcessingPipelinePhase `json:"phase,omitempty"`
 
 	// backlog is the last observed number of undelivered messages on the
-	// pipeline's queue, surfaced as the BACKLOG printer column.
+	// pipeline's queue (WR-013 surfaces this as the BACKLOG printer
+	// column).
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	Backlog int32 `json:"backlog,omitempty"`
 
-	// replicas is the last observed number of worker replicas, surfaced
-	// as the REPLICAS printer column.
+	// replicas is the last observed number of worker replicas (WR-013
+	// surfaces this as the REPLICAS printer column).
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	Replicas int32 `json:"replicas,omitempty"`
