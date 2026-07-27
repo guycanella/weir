@@ -80,8 +80,15 @@ var _ = Describe("ProcessingPipeline Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("not marking a valid spec as Failed")
+			// The full spec-validation contract (conditions, phases,
+			// self-healing, idempotency) lives in
+			// processingpipeline_validation_test.go; this baseline case
+			// only guards that the happy path stays happy.
+			reconciled := &weirdevv1alpha1.ProcessingPipeline{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
+			Expect(reconciled.Status.Phase).NotTo(Equal(weirdevv1alpha1.ProcessingPipelinePhaseFailed))
 		})
 	})
 })
