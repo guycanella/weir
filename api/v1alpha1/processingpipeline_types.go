@@ -68,6 +68,8 @@ type ProcessingPipelineWorker struct {
 	// concurrency is the number of events a single worker replica
 	// processes in parallel.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
 	Concurrency int32 `json:"concurrency,omitempty"`
 }
 
@@ -163,10 +165,12 @@ type ProcessingPipelineStatus struct {
 	// conditions represent the current state of the ProcessingPipeline resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
+	// Condition types this operator writes:
+	// - "SpecValid": whether the spec passed internal/pipelinespec.ValidateSpec
+	//   (True/ValidSpec once accepted, False/InvalidSpec naming each violation).
+	//   A future aggregate "Ready" condition is expected to be derived from
+	//   SpecValid && Provisioned && ... rather than written directly by a
+	//   reconciler that provisions nothing yet.
 	//
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map

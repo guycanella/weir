@@ -104,10 +104,12 @@ spec:
                 description: worker describes the image that processes each event.
                 properties:
                   concurrency:
+                    default: 1
                     description: |-
                       concurrency is the number of events a single worker replica
                       processes in parallel.
                     format: int32
+                    minimum: 1
                     type: integer
                   image:
                     description: image is the container image run for each worker
@@ -151,10 +153,12 @@ spec:
                   conditions represent the current state of the ProcessingPipeline resource.
                   Each condition has a unique type and reflects the status of a specific aspect of the resource.
 
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
+                  Condition types this operator writes:
+                  - "SpecValid": whether the spec passed internal/pipelinespec.ValidateSpec
+                    (True/ValidSpec once accepted, False/InvalidSpec naming each violation).
+                    A future aggregate "Ready" condition is expected to be derived from
+                    SpecValid && Provisioned && ... rather than written directly by a
+                    reconciler that provisions nothing yet.
 
                   The status of each condition is one of True, False, or Unknown.
                 items:

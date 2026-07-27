@@ -32,16 +32,25 @@ import (
 //  3. Error order is DETERMINISTIC. Checks run in this fixed sequence, and
 //     each violation is appended in that order:
 //
-//     1. spec.source.bucket   must be non-empty
-//     2. spec.worker.image    must be non-empty
-//     3. spec.scaling.min     must be >= 0
-//     4. spec.scaling.max     must be >= 0
-//     5. spec.scaling.min     must be <= spec.scaling.max
-//     6. spec.scaling.perReplica must be > 0
+//     1. spec.source.bucket      must be non-empty
+//     2. spec.worker.image       must be non-empty
+//     3. spec.worker.concurrency must be > 0
+//     4. spec.scaling.min        must be >= 0
+//     5. spec.scaling.max        must be >= 0
+//     6. spec.scaling.min        must be <= spec.scaling.max
+//     7. spec.scaling.perReplica must be > 0
 //
 //     Determinism matters twice: identical input must produce byte-identical
 //     kubectl output (no map-iteration shuffling), and one field may legitimately
 //     carry more than one violation (see the min=-1,max=-5 case below).
+//
+//     The concurrency check (3) sits with its sibling worker field rather than
+//     at the end: the report reads in the same top-to-bottom order as the YAML
+//     the user wrote (source -> worker -> scaling), which is the property that
+//     makes a multi-violation message scannable. internal/controller's
+//     Reconcile joins these messages with "; " in whatever order they arrive,
+//     so the position is a readability contract, not a correctness one — which
+//     is exactly why it needs a test to stop it drifting silently.
 //
 //  4. A valid Spec yields nil, not an empty non-nil slice — so callers can use
 //     the idiomatic `if errs := ValidateSpec(s); errs != nil` and so the happy
@@ -67,16 +76,27 @@ import (
 //     coherent "pipeline paused" state, and inventing a `max >= 1` rule would
 //     be genuine scope creep.
 //
-// # Deliberately NOT validated here (out of WR-009's scope)
+// # Deliberately NOT validated here
 //
 //   - Full S3 bucket-name syntax (3-63 chars, lowercase, no underscores, not
 //     IP-shaped). That is a well-defined AWS rule set worth its own task; the
 //     Done-when asks only for "non-empty bucket".
 //   - OCI reference syntax / tag-vs-digest policy for worker.image.
-//   - spec.worker.concurrency (a zero value is accepted today — see the test
-//     case that pins it) and spec.source.prefix (optional; empty means
-//     whole-bucket). Neither has a downstream consumer yet; revisit when the
-//     worker lands (WR-016+).
+//   - An upper bound on spec.worker.concurrency. "Too high" is a resource
+//     question (CPU/memory limits, SQS in-flight caps) with no defensible
+//     constant; "<= 0" is a meaning question, and meaninglessness is what a
+//     validator is for.
+//   - spec.source.prefix (optional; empty legitimately means whole-bucket).
+//
+// # WR-015 addendum: spec.worker.concurrency
+//
+// WR-009 shipped with no rule for concurrency, and both its own review and
+// WR-012's flagged that as a deferred gap: a worker told to process zero (or
+// -1) events in parallel does not describe anything a controller could build,
+// yet it passed validation silently. The rule added here is the same shape as
+// spec.scaling.perReplica — strictly positive, same message — because it is
+// the same kind of quantity: a per-replica throughput knob where zero is not
+// a smaller amount of work, it is the absence of a meaning.
 
 // Compile-time assertion that ValidationError satisfies error with a value
 // receiver, so a []ValidationError element can be used directly as an error.
@@ -167,12 +187,21 @@ func TestValidateSpec(t *testing.T) {
 			want: nil,
 		},
 		{
-			// Pins a deliberate non-rule: WR-009 does not validate concurrency.
-			// If a later task adds that rule, this case should be changed on
-			// purpose, not discovered by surprise.
-			name: "concurrency is not validated by WR-009 so zero is accepted",
+			// WR-009 left concurrency unvalidated and pinned that non-rule
+			// here, explicitly so that adding the rule would be a deliberate
+			// edit to this case rather than a surprise. This is that edit
+			// (WR-015): zero is now a violation, and the boundary immediately
+			// above it must stay valid.
+			name: "concurrency of one is valid at the boundary just above zero",
 			mutate: func(s *Spec) {
-				s.Worker.Concurrency = 0
+				s.Worker.Concurrency = 1
+			},
+			want: nil,
+		},
+		{
+			name: "large concurrency is valid because the rule has no upper bound",
+			mutate: func(s *Spec) {
+				s.Worker.Concurrency = 1024
 			},
 			want: nil,
 		},
@@ -214,7 +243,47 @@ func TestValidateSpec(t *testing.T) {
 		},
 
 		// ------------------------------------------------------------------
-		// Rules 3 & 4: replica bounds may not be negative.
+		// Rule 3: spec.worker.concurrency must be > 0. The bound is strict,
+		// exactly like spec.scaling.perReplica: a replica that processes zero
+		// events in parallel is not a slower worker, it is a worker that can
+		// never make progress, and the operator would happily run a
+		// Deployment of them.
+		// ------------------------------------------------------------------
+		{
+			name: "concurrency of zero is rejected because the bound is strict",
+			mutate: func(s *Spec) {
+				s.Worker.Concurrency = 0
+			},
+			want: []wantErr{{
+				field:       "spec.worker.concurrency",
+				msgContains: "must be greater than 0",
+			}},
+		},
+		{
+			name: "negative concurrency is rejected",
+			mutate: func(s *Spec) {
+				s.Worker.Concurrency = -1
+			},
+			want: []wantErr{{
+				field:       "spec.worker.concurrency",
+				msgContains: "must be greater than 0",
+			}},
+		},
+		{
+			// Guards against a rule written as `< 0` (a copy of the min/max
+			// bound) instead of `<= 0`: that mistake still rejects -1, so a
+			// negative-only test would pass a wrong implementation. Only the
+			// zero case above distinguishes them, and this one keeps the
+			// far-negative end honest.
+			name: "large negative concurrency is rejected",
+			mutate: func(s *Spec) {
+				s.Worker.Concurrency = -1024
+			},
+			want: []wantErr{{field: "spec.worker.concurrency"}},
+		},
+
+		// ------------------------------------------------------------------
+		// Rules 4 & 5: replica bounds may not be negative.
 		// ------------------------------------------------------------------
 		{
 			name: "negative min is rejected even though it is below max",
@@ -239,7 +308,7 @@ func TestValidateSpec(t *testing.T) {
 		},
 
 		// ------------------------------------------------------------------
-		// Rule 5: spec.scaling.min must be <= spec.scaling.max.
+		// Rule 6: spec.scaling.min must be <= spec.scaling.max.
 		// ------------------------------------------------------------------
 		{
 			name: "min greater than max is rejected",
@@ -274,7 +343,7 @@ func TestValidateSpec(t *testing.T) {
 		},
 
 		// ------------------------------------------------------------------
-		// Rule 6: spec.scaling.perReplica must be > 0. Zero is a violation,
+		// Rule 7: spec.scaling.perReplica must be > 0. Zero is a violation,
 		// not just negatives — desiredReplicas divides by it.
 		// ------------------------------------------------------------------
 		{
@@ -309,10 +378,45 @@ func TestValidateSpec(t *testing.T) {
 			},
 		},
 		{
+			// Pins the concurrency check's exact position in the fixed order:
+			// after the worker.image check, before any scaling check. Picking
+			// one violation on either side of it is what makes this an
+			// ordering assertion rather than a set-membership one.
+			name: "invalid concurrency is reported between the image and scaling violations",
+			mutate: func(s *Spec) {
+				s.Worker.Image = ""
+				s.Worker.Concurrency = 0
+				s.Scaling.Min = -1
+			},
+			want: []wantErr{
+				{field: "spec.worker.image"},
+				{field: "spec.worker.concurrency"},
+				{field: "spec.scaling.min"},
+			},
+		},
+		{
+			// The same ordering claim with the neighbouring checks *passing*,
+			// so an implementation that appended concurrency last would still
+			// be caught: here only bucket precedes it and only perReplica
+			// follows it.
+			name: "invalid concurrency is reported after bucket and before perReplica",
+			mutate: func(s *Spec) {
+				s.Source.Bucket = ""
+				s.Worker.Concurrency = -2
+				s.Scaling.PerReplica = 0
+			},
+			want: []wantErr{
+				{field: "spec.source.bucket"},
+				{field: "spec.worker.concurrency"},
+				{field: "spec.scaling.perReplica"},
+			},
+		},
+		{
 			name: "every rule violated at once is reported in declared order",
 			mutate: func(s *Spec) {
 				s.Source.Bucket = ""
 				s.Worker.Image = ""
+				s.Worker.Concurrency = 0
 				s.Scaling.Min = 21
 				s.Scaling.Max = 20
 				s.Scaling.PerReplica = -3
@@ -320,6 +424,7 @@ func TestValidateSpec(t *testing.T) {
 			want: []wantErr{
 				{field: "spec.source.bucket"},
 				{field: "spec.worker.image"},
+				{field: "spec.worker.concurrency"},
 				{field: "spec.scaling.min", msgContains: "max"},
 				{field: "spec.scaling.perReplica"},
 			},
@@ -327,7 +432,9 @@ func TestValidateSpec(t *testing.T) {
 		{
 			// The zero-value Spec is what a CR with `spec: {}` deserializes
 			// into, so it must produce a helpful report rather than panic or
-			// pass. min=0/max=0 are fine; the three required-ish fields are not.
+			// pass. min=0/max=0 are fine; the four required-ish fields are
+			// not — concurrency joins them under WR-015, because its zero
+			// value is now a violation rather than an accepted default.
 			name: "zero-value spec reports every missing requirement",
 			mutate: func(s *Spec) {
 				*s = Spec{}
@@ -335,6 +442,7 @@ func TestValidateSpec(t *testing.T) {
 			want: []wantErr{
 				{field: "spec.source.bucket"},
 				{field: "spec.worker.image"},
+				{field: "spec.worker.concurrency"},
 				{field: "spec.scaling.perReplica"},
 			},
 		},
