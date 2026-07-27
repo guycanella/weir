@@ -1,8 +1,28 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: weir
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
-rules: []
+rules:
+- apiGroups:
+  - weir.dev
+  resources:
+  - processingpipelines
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - weir.dev
+  resources:
+  - processingpipelines/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - weir.dev
+  resources:
+  - processingpipelines/status
+  verbs:
+  - get
+  - patch
+  - update
