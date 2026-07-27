@@ -14,7 +14,20 @@ spec:
     singular: processingpipeline
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .status.backlog
+      name: Backlog
+      type: integer
+    - jsonPath: .status.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: ProcessingPipeline is the Schema for the processingpipelines
@@ -116,8 +129,20 @@ spec:
               backlog:
                 description: |-
                   backlog is the last observed number of undelivered messages on the
-                  pipeline's queue (WR-013 surfaces this as the BACKLOG printer
-                  column).
+                  pipeline's queue, surfaced as the BACKLOG printer column. nil means
+                  no observation has been made yet - distinct from an observed 0,
+                  which is the pipeline's normal scale-to-zero steady state
+                  (ADR-002), not an absent measurement.
+
+                  This is a pointer rather than a plain int32 so the two states don't
+                  collapse into each other: encoding/json always serializes a plain
+                  int32 (there is no Go zero value that means "unset"), so a status
+                  update that only sets Phase and never touches Backlog would still
+                  marshal "backlog": 0, falsely reporting an observed empty queue
+                  when in truth nothing was ever observed. `omitempty` on a pointer
+                  only treats nil as empty - a non-nil pointer to 0 still serializes,
+                  so the BACKLOG printer column still shows 0 for genuine
+                  scale-to-zero.
                 format: int32
                 minimum: 0
                 type: integer
@@ -192,8 +217,8 @@ spec:
                 x-kubernetes-list-type: map
               phase:
                 description: |-
-                  phase is a coarse summary of the pipeline's reconcile lifecycle
-                  (WR-013 surfaces this as the STATUS printer column).
+                  phase is a coarse summary of the pipeline's reconcile lifecycle,
+                  surfaced as the STATUS printer column.
                 enum:
                 - Pending
                 - Provisioning
@@ -202,8 +227,11 @@ spec:
                 type: string
               replicas:
                 description: |-
-                  replicas is the last observed number of worker replicas (WR-013
-                  surfaces this as the REPLICAS printer column).
+                  replicas is the last observed number of worker replicas, surfaced
+                  as the REPLICAS printer column. See the Backlog field's comment:
+                  nil means "never observed", distinct from an observed 0
+                  (scale-to-zero), and the same pointer + omitempty reasoning
+                  applies.
                 format: int32
                 minimum: 0
                 type: integer
