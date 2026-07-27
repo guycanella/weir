@@ -13,6 +13,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -166,6 +167,28 @@ func reconcileOnce(c client.Client, key types.NamespacedName) reconcile.Result {
 		"a spec-validation verdict must be reported through status, never returned as an error")
 
 	return result
+}
+
+// expectSchemaRejection asserts the API server refused the object at
+// admission *because of the named field*, rather than the much weaker "Create
+// returned something non-nil".
+//
+// The weak form is a trap: any other failure mode - a lost connection, a
+// missing CRD, or a regression in a completely unrelated field's markers -
+// also makes Create fail, so the spec would stay green while the rule it
+// claims to pin went unexercised. Checking both that the error is a genuine
+// Invalid (admission rejected the payload) and that its message names the
+// field closes that hole.
+func expectSchemaRejection(obj client.Object, field string) {
+	GinkgoHelper()
+
+	err := k8sClient.Create(ctx, obj)
+	Expect(err).To(HaveOccurred(), "the API server must reject %s at admission", field)
+	Expect(apierrors.IsInvalid(err)).To(BeTrue(),
+		"expected an admission-time schema rejection (Reason=Invalid), got: %v", err)
+	Expect(err.Error()).To(ContainSubstring(field),
+		"the rejection must name %s - otherwise some unrelated rule tripped and this rule is untested; got: %v",
+		field, err)
 }
 
 func specValidCondition(pipeline *weirdevv1alpha1.ProcessingPipeline) *metav1.Condition {
@@ -372,26 +395,26 @@ var _ = Describe("ProcessingPipeline spec validation", func() {
 			pipeline := newValidationTestPipeline("schema-empty-bucket", 0, 5, 10)
 			pipeline.Spec.Source.Bucket = ""
 
-			Expect(k8sClient.Create(ctx, pipeline)).NotTo(Succeed())
+			expectSchemaRejection(pipeline, "spec.source.bucket")
 		})
 
 		It("rejects a whitespace-only worker.image", func() {
 			pipeline := newValidationTestPipeline("schema-blank-image", 0, 5, 10)
 			pipeline.Spec.Worker.Image = "   "
 
-			Expect(k8sClient.Create(ctx, pipeline)).NotTo(Succeed())
+			expectSchemaRejection(pipeline, "spec.worker.image")
 		})
 
 		It("rejects a negative scaling.min", func() {
 			pipeline := newValidationTestPipeline("schema-negative-min", -1, 5, 10)
 
-			Expect(k8sClient.Create(ctx, pipeline)).NotTo(Succeed())
+			expectSchemaRejection(pipeline, "spec.scaling.min")
 		})
 
 		It("rejects a zero scaling.perReplica", func() {
 			pipeline := newValidationTestPipeline("schema-zero-per-replica", 0, 5, 0)
 
-			Expect(k8sClient.Create(ctx, pipeline)).NotTo(Succeed())
+			expectSchemaRejection(pipeline, "spec.scaling.perReplica")
 		})
 
 		It("rejects an explicitly zero worker.concurrency", func() {
@@ -400,8 +423,10 @@ var _ = Describe("ProcessingPipeline spec validation", func() {
 			// cannot transmit 0 - it is dropped and becomes an omission.
 			// `kubectl apply` with `concurrency: 0` in the YAML *can*, and
 			// that is the path this guards (minimum: 1 on the schema).
-			Expect(k8sClient.Create(ctx, zeroConcurrencyPipelineYAML("schema-zero-concurrency"))).
-				NotTo(Succeed())
+			expectSchemaRejection(
+				zeroConcurrencyPipelineYAML("schema-zero-concurrency"),
+				"spec.worker.concurrency",
+			)
 		})
 	})
 
