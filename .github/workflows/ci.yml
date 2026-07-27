@@ -56,5 +56,14 @@ jobs:
       - name: Set up envtest binaries
         run: make envtest
 
+      - name: Verify generated manifests are up to date
+        run: |
+          make manifests generate
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Generated files are out of date or untracked — run 'make manifests generate' and commit the result."
+            git status --porcelain
+            exit 1
+          fi
+
       - name: Test
         run: make test
