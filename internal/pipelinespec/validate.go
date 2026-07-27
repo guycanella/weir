@@ -73,6 +73,13 @@ func ValidateSpec(spec Spec) []ValidationError {
 		})
 	}
 
+	if spec.Worker.Concurrency <= 0 {
+		errs = append(errs, ValidationError{
+			Field:   "spec.worker.concurrency",
+			Message: "must be greater than 0",
+		})
+	}
+
 	if spec.Scaling.Min < 0 {
 		errs = append(errs, ValidationError{
 			Field:   "spec.scaling.min",

@@ -15,6 +15,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -112,6 +113,11 @@ func newValidationTestPipeline(name string, min, max, perReplica int32) *weirdev
 			},
 			Worker: weirdevv1alpha1.ProcessingPipelineWorker{
 				Image: "example.com/worker:latest",
+				// Set explicitly (WR-015): ValidateSpec now rejects
+				// concurrency <= 0, so leaving this at its zero value would
+				// quietly turn every "valid spec" case below into a
+				// concurrency test. These specs are about scaling bounds.
+				Concurrency: 1,
 			},
 			Scaling: weirdevv1alpha1.ProcessingPipelineScaling{
 				Min:        min,
@@ -387,5 +393,98 @@ var _ = Describe("ProcessingPipeline spec validation", func() {
 
 			Expect(k8sClient.Create(ctx, pipeline)).NotTo(Succeed())
 		})
+
+		It("rejects an explicitly zero worker.concurrency", func() {
+			// Has to go through an unstructured object: the typed struct
+			// tags concurrency `omitempty`, so a Go client physically
+			// cannot transmit 0 - it is dropped and becomes an omission.
+			// `kubectl apply` with `concurrency: 0` in the YAML *can*, and
+			// that is the path this guards (minimum: 1 on the schema).
+			Expect(k8sClient.Create(ctx, zeroConcurrencyPipelineYAML("schema-zero-concurrency"))).
+				NotTo(Succeed())
+		})
+	})
+
+	// -----------------------------------------------------------------------
+	// worker.concurrency (WR-015)
+	// -----------------------------------------------------------------------
+	//
+	// internal/pipelinespec.ValidateSpec now rejects concurrency <= 0. That
+	// rule closes a real gap - a worker processing zero events in parallel
+	// describes nothing - but on its own it breaks a field the CRD advertises
+	// as Optional: an omitted concurrency decodes to the Go zero value, and
+	// the reconciler would mark the pipeline Failed for not setting a field
+	// the user was told they could leave out. So the rule has to arrive with
+	// an API-server default.
+	//
+	// Why the default belongs on the schema and not in toPipelineSpec: a
+	// value the API server writes is visible in `kubectl get -o yaml`, so the
+	// user can see the concurrency their workers actually run with. A
+	// fallback applied inside the reconciler would leave the stored spec
+	// disagreeing with the running behaviour, and would also make the
+	// pure-core rule permanently unreachable from the CRD path - defence that
+	// can never fire is not defence.
+	Context("when worker.concurrency is omitted", func() {
+		It("has the API server default it, so a valid spec is stored", func() {
+			pipeline := newValidationTestPipeline("concurrency-omitted", 0, 5, 10)
+			pipeline.Spec.Worker.Concurrency = 0 // omitempty: not sent at all
+
+			key := createForTest(pipeline)
+
+			Expect(fetchPipeline(key).Spec.Worker.Concurrency).To(BeEquivalentTo(1),
+				"omitting an optional field must not store a value the validator rejects; "+
+					"1 is the conservative default - one event at a time is what a user who said nothing expects, "+
+					"and it never invents parallelism they did not ask for")
+		})
+
+		It("reconciles to SpecValid instead of Failed", func() {
+			pipeline := newValidationTestPipeline("concurrency-omitted-reconcile", 0, 5, 10)
+			pipeline.Spec.Worker.Concurrency = 0
+
+			key := createForTest(pipeline)
+			reconcileOnce(k8sClient, key)
+
+			reconciled := fetchPipeline(key)
+			Expect(reconciled.Status.Phase).NotTo(Equal(weirdevv1alpha1.ProcessingPipelinePhaseFailed),
+				"a CR that omits an Optional field must not be marked Failed")
+			Expect(reconciled.Status.Phase).To(Equal(weirdevv1alpha1.ProcessingPipelinePhasePending))
+
+			condition := specValidCondition(reconciled)
+			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(condition.Reason).To(Equal(wantReasonValidSpec))
+			Expect(condition.Message).NotTo(ContainSubstring("spec.worker.concurrency"))
+		})
 	})
 })
+
+// zeroConcurrencyPipelineYAML builds the object a user would get from
+// `kubectl apply` on a manifest with an explicit `concurrency: 0`. It is
+// unstructured on purpose: the typed Go struct cannot represent the
+// difference between "0" and "absent".
+func zeroConcurrencyPipelineYAML(name string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": "default",
+			},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"bucket": "test-bucket",
+				},
+				"worker": map[string]interface{}{
+					"image":       "example.com/worker:latest",
+					"concurrency": int64(0),
+				},
+				"scaling": map[string]interface{}{
+					"min":        int64(0),
+					"max":        int64(5),
+					"perReplica": int64(10),
+				},
+			},
+		},
+	}
+	obj.SetGroupVersionKind(weirdevv1alpha1.GroupVersion.WithKind("ProcessingPipeline"))
+
+	return obj
+}

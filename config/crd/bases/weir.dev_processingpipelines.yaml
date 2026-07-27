@@ -104,10 +104,12 @@ spec:
                 description: worker describes the image that processes each event.
                 properties:
                   concurrency:
+                    default: 1
                     description: |-
                       concurrency is the number of events a single worker replica
                       processes in parallel.
                     format: int32
+                    minimum: 1
                     type: integer
                   image:
                     description: image is the container image run for each worker

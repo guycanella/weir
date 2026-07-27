@@ -68,6 +68,8 @@ type ProcessingPipelineWorker struct {
 	// concurrency is the number of events a single worker replica
 	// processes in parallel.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
 	Concurrency int32 `json:"concurrency,omitempty"`
 }
 
