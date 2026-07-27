@@ -20,10 +20,10 @@ import (
 //
 // Status.Backlog is an observation the shell polls from SQS, not a spec
 // value; the pure decision core (internal/scaling.desiredReplicas) consumes
-// a widened plain-int copy of this value, so int32 here (the conventional
-// explicit-width type for Kubernetes API count fields, matching
-// Status.Replicas) does not constrain that boundary. Status.Replicas itself
-// matches appsv1.DeploymentStatus.Replicas's type by convention.
+// a dereferenced, widened plain-int copy of this value, so *int32 here
+// (a pointer so nil can distinguish "never observed" from an observed 0 -
+// see the field's own doc comment) does not constrain that boundary.
+// Status.Replicas mirrors the same pointer shape for the same reason.
 
 // ProcessingPipelineSpec defines the desired state of ProcessingPipeline
 type ProcessingPipelineSpec struct {
@@ -126,24 +126,39 @@ const (
 
 // ProcessingPipelineStatus defines the observed state of ProcessingPipeline.
 type ProcessingPipelineStatus struct {
-	// phase is a coarse summary of the pipeline's reconcile lifecycle
-	// (WR-013 surfaces this as the STATUS printer column).
+	// phase is a coarse summary of the pipeline's reconcile lifecycle,
+	// surfaced as the STATUS printer column.
 	// +kubebuilder:validation:Enum=Pending;Provisioning;Running;Failed
 	// +optional
 	Phase ProcessingPipelinePhase `json:"phase,omitempty"`
 
 	// backlog is the last observed number of undelivered messages on the
-	// pipeline's queue (WR-013 surfaces this as the BACKLOG printer
-	// column).
+	// pipeline's queue, surfaced as the BACKLOG printer column. nil means
+	// no observation has been made yet - distinct from an observed 0,
+	// which is the pipeline's normal scale-to-zero steady state
+	// (ADR-002), not an absent measurement.
+	//
+	// This is a pointer rather than a plain int32 so the two states don't
+	// collapse into each other: encoding/json always serializes a plain
+	// int32 (there is no Go zero value that means "unset"), so a status
+	// update that only sets Phase and never touches Backlog would still
+	// marshal "backlog": 0, falsely reporting an observed empty queue
+	// when in truth nothing was ever observed. `omitempty` on a pointer
+	// only treats nil as empty - a non-nil pointer to 0 still serializes,
+	// so the BACKLOG printer column still shows 0 for genuine
+	// scale-to-zero.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
-	Backlog int32 `json:"backlog,omitempty"`
+	Backlog *int32 `json:"backlog,omitempty"`
 
-	// replicas is the last observed number of worker replicas (WR-013
-	// surfaces this as the REPLICAS printer column).
+	// replicas is the last observed number of worker replicas, surfaced
+	// as the REPLICAS printer column. See the Backlog field's comment:
+	// nil means "never observed", distinct from an observed 0
+	// (scale-to-zero), and the same pointer + omitempty reasoning
+	// applies.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
-	Replicas int32 `json:"replicas,omitempty"`
+	Replicas *int32 `json:"replicas,omitempty"`
 
 	// conditions represent the current state of the ProcessingPipeline resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
@@ -162,6 +177,10 @@ type ProcessingPipelineStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Backlog",type=integer,JSONPath=".status.backlog"
+// +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=".status.replicas"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // ProcessingPipeline is the Schema for the processingpipelines API
 type ProcessingPipeline struct {
