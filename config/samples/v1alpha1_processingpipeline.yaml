@@ -1,0 +1,18 @@
+apiVersion: weir.dev/v1alpha1
+kind: ProcessingPipeline
+metadata:
+  labels:
+    app.kubernetes.io/name: weir
+    app.kubernetes.io/managed-by: kustomize
+  name: processingpipeline-sample
+spec:
+  source:
+    bucket: uploads
+    prefix: raw/
+  worker:
+    image: ghcr.io/you/transcoder:v1
+    concurrency: 4
+  scaling:
+    min: 0
+    max: 20
+    perReplica: 30

@@ -50,5 +50,11 @@ jobs:
       - name: Build
         run: make build
 
+      - name: Install dev tools (controller-gen, setup-envtest)
+        run: make tools
+
+      - name: Set up envtest binaries
+        run: make envtest
+
       - name: Test
         run: make test
