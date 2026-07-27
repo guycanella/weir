@@ -10,3 +10,19 @@ cover.out
 .env.*
 secrets/
 .claude/settings.json
+
+# kubebuilder scaffold (WR-011) — build/test artifacts and editor cruft
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+.idea
+.vscode
+*.swp
+*.swo
+*~
+*.kubeconfig
