@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -497,7 +498,7 @@ func TestSNSListSubscriptionsByTopicPaginatesWithNextToken(t *testing.T) {
 				t.Errorf("page sizes = %v, want %v (at most ListPageSize=%d per call)",
 					gotPageSizes, tc.wantPageSizes, tc.pageSize)
 			}
-			if !equalStrings(gotARNs, wantARNs) {
+			if !slices.Equal(gotARNs, wantARNs) {
 				t.Errorf("the pages together listed %v, want every subscription in creation order %v: "+
 					"no subscription may be skipped between pages", gotARNs, wantARNs)
 			}
@@ -636,7 +637,7 @@ func TestSNSListSubscriptionsByTopicDefaultsToTheRealSNSPageSize(t *testing.T) {
 			t.Errorf("page sizes = %v, want [5]: five subscriptions are well under the default page size, "+
 				"so one call must return them all with an empty NextToken", gotPageSizes)
 		}
-		if !equalStrings(gotARNs, wantARNs) {
+		if !slices.Equal(gotARNs, wantARNs) {
 			t.Errorf("listed %v, want %v", gotARNs, wantARNs)
 		}
 	})
@@ -661,7 +662,7 @@ func TestSNSListSubscriptionsByTopicDefaultsToTheRealSNSPageSize(t *testing.T) {
 					"fall back to real SNS's %d, not to unbounded",
 					tc.pageSize, gotPageSizes, want, defaultPageSize)
 			}
-			if !equalStrings(gotARNs, wantARNs) {
+			if !slices.Equal(gotARNs, wantARNs) {
 				t.Errorf("the pages together listed %d subscriptions, want all %d in creation order",
 					len(gotARNs), len(wantARNs))
 			}

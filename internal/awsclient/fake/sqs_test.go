@@ -650,7 +650,7 @@ func TestSQSReceiveMessageIsFIFOAndRespectsMaxNumberOfMessages(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReceiveMessage returned error %v, want nil", err)
 			}
-			if got := bodiesOf(out.Messages); !equalStrings(got, tc.want) {
+			if got := bodiesOf(out.Messages); !slices.Equal(got, tc.want) {
 				t.Errorf("ReceiveMessage(max=%d) returned bodies %v, want %v (oldest first)",
 					tc.max, got, tc.want)
 			}
@@ -661,7 +661,7 @@ func TestSQSReceiveMessageIsFIFOAndRespectsMaxNumberOfMessages(t *testing.T) {
 			if err != nil {
 				t.Fatalf("second ReceiveMessage returned error %v, want nil", err)
 			}
-			if got := bodiesOf(rest.Messages); !equalStrings(got, tc.after) {
+			if got := bodiesOf(rest.Messages); !slices.Equal(got, tc.after) {
 				t.Errorf("the second ReceiveMessage returned %v, want %v: a message already in flight "+
 					"must not be handed out again", got, tc.after)
 			}
@@ -839,7 +839,7 @@ func TestSQSExpireInFlightWithNothingInFlightReturnsZero(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReceiveMessage returned error %v, want nil", err)
 		}
-		if got := bodiesOf(out.Messages); !equalStrings(got, []string{"a", "b"}) {
+		if got := bodiesOf(out.Messages); !slices.Equal(got, []string{"a", "b"}) {
 			t.Errorf("ReceiveMessage returned %v, want [a b] still in order: ExpireInFlight must not "+
 				"reorder or duplicate untouched pending messages", got)
 		}
@@ -1031,7 +1031,7 @@ func TestSQSExpireInFlightRequeuesEveryInFlightMessageAheadOfNewerOnes(t *testin
 		t.Errorf("the drained order was %v, want the two expired messages first and %q last: expired "+
 			"messages are requeued at the front", bodies, "c")
 	}
-	if requeued := []string{bodies[0], bodies[1]}; !equalStrings(sortedCopy(requeued), []string{"a", "b"}) {
+	if requeued := []string{bodies[0], bodies[1]}; !slices.Equal(sortedCopy(requeued), []string{"a", "b"}) {
 		t.Errorf("the first two messages were %v, want a and b in either order", requeued)
 	}
 
@@ -1290,7 +1290,7 @@ func TestSQSQueuesAreIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReceiveMessage from the DLQ returned error %v, want nil", err)
 	}
-	if got := bodiesOf(out.Messages); !equalStrings(got, []string{"parked"}) {
+	if got := bodiesOf(out.Messages); !slices.Equal(got, []string{"parked"}) {
 		t.Errorf("the DLQ delivered %v, want only [parked]: receiving from one queue must not reach "+
 			"another's messages", got)
 	}
@@ -1414,7 +1414,7 @@ func TestSQSReceiveMessageFailureLeavesMessagesPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReceiveMessage after the injected failure returned error %v, want nil", err)
 	}
-	if got := bodiesOf(out.Messages); !equalStrings(got, []string{"keep-me"}) {
+	if got := bodiesOf(out.Messages); !slices.Equal(got, []string{"keep-me"}) {
 		t.Errorf("the retried receive returned %v, want [keep-me]", got)
 	}
 }
@@ -1744,7 +1744,7 @@ func TestSQSConcurrentReceiveAndExpireInFlightLosesNoMessage(t *testing.T) {
 // --- helpers --------------------------------------------------------------
 
 func sortedCopy(in []string) []string {
-	out := append([]string(nil), in...)
+	out := slices.Clone(in)
 	slices.Sort(out)
 	return out
 }
@@ -1758,16 +1758,4 @@ func bodiesOf(msgs []awsclient.Message) []string {
 		out = append(out, m.Body)
 	}
 	return out
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
