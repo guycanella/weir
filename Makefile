@@ -74,6 +74,10 @@ vet: ## Run go vet
 	go vet ./...
 
 .PHONY: lint
+# --build-tags=integration makes golangci-lint also analyze //go:build integration
+# files (e.g. internal/awsclient/awssdk/smoke_integration_test.go), which the
+# default build-tagless invocation silently skips. Add more tags here
+# (comma-separated) if future WR tasks introduce other build tags.
 lint: ## Run golangci-lint
 	@$(call need,golangci-lint,install: https://golangci-lint.run/welcome/install/)
 	@pkgs=$$(go list ./... 2>/dev/null); status=$$?; \
@@ -86,7 +90,7 @@ lint: ## Run golangci-lint
 	  echo "→ no Go packages yet — nothing to lint (expected on the empty skeleton)."; \
 	  exit 0; \
 	fi; \
-	golangci-lint run
+	golangci-lint run --build-tags=integration
 
 .PHONY: build
 build: ## Compile all packages
@@ -127,6 +131,7 @@ test-integration: ## Run kind + LocalStack integration tests (needs deploy-local
 	@docker ps --format '{{.Names}}' | grep -q '^$(LOCALSTACK_CONTAINER)$$' || { \
 	  echo "✗ LocalStack not running — start it with 'make localstack-up' (WR-004)"; exit 1; }
 	AWS_ENDPOINT_URL=$(AWS_ENDPOINT_URL) AWS_REGION=$(AWS_REGION) \
+	AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_PROFILE= AWS_EC2_METADATA_DISABLED=true \
 	  go test -tags=integration ./... -count=1
 
 ##@ Code generation (kubebuilder / controller-gen — WR-011..WR-014)
