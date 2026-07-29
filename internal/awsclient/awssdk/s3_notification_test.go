@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -207,7 +208,7 @@ func TestPutBucketNotificationConfigurationSerializesFilterOnlyWhenSet(t *testin
 			if topic.Topic != topicARN {
 				t.Errorf("TopicConfiguration Topic = %q, want %q\nbody: %s", topic.Topic, topicARN, body)
 			}
-			if want := []string{"s3:ObjectCreated:*"}; !equalStrings(topic.Events, want) {
+			if want := []string{"s3:ObjectCreated:*"}; !slices.Equal(topic.Events, want) {
 				t.Errorf("TopicConfiguration Events = %v, want %v\nbody: %s", topic.Events, want, body)
 			}
 
@@ -234,16 +235,4 @@ func TestPutBucketNotificationConfigurationSerializesFilterOnlyWhenSet(t *testin
 			}
 		})
 	}
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
