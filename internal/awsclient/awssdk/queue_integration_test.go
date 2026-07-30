@@ -68,10 +68,6 @@ func TestEnsureQueueAgainstLocalStack(t *testing.T) {
 	}
 	assertQueueSetNonEmpty(t, "first call", first)
 
-	t.Run("QueueSet fields are non-empty after first call", func(t *testing.T) {
-		assertQueueSetNonEmpty(t, "first call", first)
-	})
-
 	t.Run("DLQ is distinct from main queue", func(t *testing.T) {
 		if first.MainQueueURL == first.DLQueueURL {
 			t.Error("MainQueueURL and DLQueueURL are the same — must be distinct queues")
@@ -188,19 +184,19 @@ func TestEnsureQueueAgainstLocalStack(t *testing.T) {
 func assertQueueSetNonEmpty(t *testing.T, label string, qs provisioner.QueueSet) {
 	t.Helper()
 	if qs.MainQueueURL == "" {
-		t.Errorf("%s: QueueSet.MainQueueURL is empty", label)
+		t.Fatalf("%s: QueueSet.MainQueueURL is empty", label)
 	}
 	if qs.MainQueueARN == "" {
-		t.Errorf("%s: QueueSet.MainQueueARN is empty", label)
+		t.Fatalf("%s: QueueSet.MainQueueARN is empty", label)
 	}
 	if qs.DLQueueURL == "" {
-		t.Errorf("%s: QueueSet.DLQueueURL is empty", label)
+		t.Fatalf("%s: QueueSet.DLQueueURL is empty", label)
 	}
 	if qs.DLQueueARN == "" {
-		t.Errorf("%s: QueueSet.DLQueueARN is empty", label)
+		t.Fatalf("%s: QueueSet.DLQueueARN is empty", label)
 	}
 	if qs.TopicARN == "" {
-		t.Errorf("%s: QueueSet.TopicARN is empty", label)
+		t.Fatalf("%s: QueueSet.TopicARN is empty", label)
 	}
 }
 

@@ -90,6 +90,19 @@ type QueueConfig struct {
 // need for subsequent provisioning steps (WR-019) and for wiring the
 // reconciler's status.
 func EnsureQueue(ctx context.Context, sqs awsclient.SQSClient, sns awsclient.SNSClient, cfg QueueConfig) (QueueSet, error) {
+	// ── 0. Validate config ───────────────────────────────────────────────────
+	// Check fields that real SQS/SNS will reject anyway, but only after side
+	// effects (e.g. DLQ creation). Catching them here gives a clear error and
+	// prevents partial provisioning state.
+	if cfg.MainQueueName == "" || cfg.DLQueueName == "" || cfg.TopicName == "" {
+		return QueueSet{}, fmt.Errorf("provisioner: MainQueueName, DLQueueName and TopicName are required")
+	}
+	if cfg.MaxReceiveCount < 1 {
+		return QueueSet{}, fmt.Errorf("provisioner: MaxReceiveCount must be >= 1, got %d", cfg.MaxReceiveCount)
+	}
+	if cfg.VisibilityTimeout < 0 || cfg.VisibilityTimeout > 43200 {
+		return QueueSet{}, fmt.Errorf("provisioner: VisibilityTimeout must be in [0, 43200] seconds, got %d", cfg.VisibilityTimeout)
+	}
 	// ── 1. DLQ ──────────────────────────────────────────────────────────────
 	dlqOut, err := sqs.CreateQueue(ctx, awsclient.CreateQueueInput{
 		Name: cfg.DLQueueName,
@@ -113,15 +126,10 @@ func EnsureQueue(ctx context.Context, sqs awsclient.SQSClient, sns awsclient.SNS
 
 	// ── 2. Main queue ────────────────────────────────────────────────────────
 	// CreateQueue is idempotent on name (returns the existing URL), so we
-	// always call it and then unconditionally apply the visibility timeout and
-	// redrive policy via SetQueueAttributes — this is the level-triggered
-	// "converge to desired" pattern: even if the queue already existed with
-	// different settings, the next call to EnsureQueue will correct them.
-	redrivePolicy, err := marshalRedrivePolicy(dlqARN, cfg.MaxReceiveCount)
-	if err != nil {
-		return QueueSet{}, fmt.Errorf("provisioner: marshal redrive policy: %w", err)
-	}
-
+	// always call it and then unconditionally apply all attributes via a single
+	// SetQueueAttributes — the level-triggered "converge to desired" pattern:
+	// even if the queue already existed with different settings, the next call
+	// to EnsureQueue will correct them.
 	mainOut, err := sqs.CreateQueue(ctx, awsclient.CreateQueueInput{
 		Name: cfg.MainQueueName,
 	})
@@ -142,17 +150,9 @@ func EnsureQueue(ctx context.Context, sqs awsclient.SQSClient, sns awsclient.SNS
 		return QueueSet{}, fmt.Errorf("provisioner: main queue %q reported no QueueArn", cfg.MainQueueName)
 	}
 
-	if _, err := sqs.SetQueueAttributes(ctx, awsclient.SetQueueAttributesInput{
-		QueueUrl: mainURL,
-		Attributes: map[string]string{
-			"VisibilityTimeout": fmt.Sprintf("%d", cfg.VisibilityTimeout),
-			"RedrivePolicy":     redrivePolicy,
-		},
-	}); err != nil {
-		return QueueSet{}, fmt.Errorf("provisioner: set main queue attributes for %q: %w", cfg.MainQueueName, err)
-	}
-
 	// ── 3. SNS topic ─────────────────────────────────────────────────────────
+	// Created before SetQueueAttributes so the topic ARN is available when we
+	// build the queue policy's aws:SourceArn condition.
 	topicOut, err := sns.CreateTopic(ctx, awsclient.CreateTopicInput{
 		Name: cfg.TopicName,
 	})
@@ -161,13 +161,22 @@ func EnsureQueue(ctx context.Context, sqs awsclient.SQSClient, sns awsclient.SNS
 	}
 	topicARN := topicOut.TopicArn
 
-	// ── 4. SQS queue policy (allow SNS to deliver messages) ──────────────────
-	// On real AWS, SNS cannot deliver to SQS unless the queue has a
-	// resource-based policy granting sns.amazonaws.com sqs:SendMessage,
-	// conditioned on aws:SourceArn = topicARN. We set this unconditionally on
-	// every call (level-triggered): if the policy already matches the desired
-	// state, AWS accepts it as a no-op. The fake stores it as the "Policy"
-	// attribute and does not enforce it, matching LocalStack's behaviour.
+	// ── 4. Main queue attributes (single call) ───────────────────────────────
+	// VisibilityTimeout, RedrivePolicy and the IAM queue policy are written in
+	// one SetQueueAttributes request. This eliminates the window between the
+	// two former calls where the redrive policy was live but the SNS delivery
+	// policy was not, and saves a round-trip on every reconciliation.
+	//
+	// The queue policy grants sns.amazonaws.com sqs:SendMessage on mainARN,
+	// conditioned on aws:SourceArn = topicARN. On real AWS this is required
+	// for SNS to deliver messages; without it delivery silently fails.
+	// LocalStack does not enforce this policy, which is why the integration
+	// test passes either way — the unit test TestEnsureQueueSetsQueuePolicy
+	// provides mutation-detection coverage.
+	redrivePolicy, err := marshalRedrivePolicy(dlqARN, cfg.MaxReceiveCount)
+	if err != nil {
+		return QueueSet{}, fmt.Errorf("provisioner: marshal redrive policy: %w", err)
+	}
 	queuePolicy, err := marshalQueuePolicy(mainARN, topicARN)
 	if err != nil {
 		return QueueSet{}, fmt.Errorf("provisioner: marshal queue policy: %w", err)
@@ -175,10 +184,12 @@ func EnsureQueue(ctx context.Context, sqs awsclient.SQSClient, sns awsclient.SNS
 	if _, err := sqs.SetQueueAttributes(ctx, awsclient.SetQueueAttributesInput{
 		QueueUrl: mainURL,
 		Attributes: map[string]string{
-			"Policy": queuePolicy,
+			"VisibilityTimeout": fmt.Sprintf("%d", cfg.VisibilityTimeout),
+			"RedrivePolicy":     redrivePolicy,
+			"Policy":            queuePolicy,
 		},
 	}); err != nil {
-		return QueueSet{}, fmt.Errorf("provisioner: set queue policy for %q: %w", cfg.MainQueueName, err)
+		return QueueSet{}, fmt.Errorf("provisioner: set main queue attributes for %q: %w", cfg.MainQueueName, err)
 	}
 
 	// ── 5. SNS → SQS subscription (idempotent ensure) ───────────────────────
@@ -225,6 +236,11 @@ func ensureSubscription(ctx context.Context, sns awsclient.SNSClient, topicARN, 
 
 		if out.NextToken == "" {
 			break
+		}
+		if out.NextToken == nextToken {
+			// Guard against a misbehaving backend that echoes the same token,
+			// which would otherwise spin this loop forever.
+			return fmt.Errorf("list subscriptions: pagination token did not advance")
 		}
 		nextToken = out.NextToken
 	}

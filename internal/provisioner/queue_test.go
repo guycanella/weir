@@ -246,10 +246,9 @@ func TestEnsureQueueDLQIsDistinctFromMainQueue(t *testing.T) {
 }
 
 // TestEnsureQueueRedrivePolicyUpdatedOnSecondCall verifies the level-triggered
-// convergence property: if the main queue was previously created (possibly
-// by a different EnsureQueue call, or by some other means) with a different
-// VisibilityTimeout, a subsequent EnsureQueue call with updated config
-// converges the attribute to the new desired value.
+// convergence property: if the main queue already exists with a different
+// MaxReceiveCount, a subsequent EnsureQueue call with updated config converges
+// the RedrivePolicy to the new desired value.
 func TestEnsureQueueRedrivePolicyUpdatedOnSecondCall(t *testing.T) {
 	ctx := t.Context()
 	sqsFake := fake.NewSQS()
@@ -359,7 +358,7 @@ func TestEnsureQueueSubscriptionExistsAfterPaginatedList(t *testing.T) {
 		// Clear all subscriptions so the next call finds no endpoint on any page.
 		delete(snsFake.Subscriptions, first.TopicARN)
 
-		// Seed noise-only subscriptions (3 pages worth at size 2).
+		// Seed noise-only subscriptions (4 items, 2 full pages at page size 2).
 		for i := range 4 {
 			snsFake.Subscriptions[first.TopicARN] = append(
 				snsFake.Subscriptions[first.TopicARN],
@@ -509,6 +508,4 @@ func (s *sqsFailOnName) CreateQueue(ctx context.Context, in awsclient.CreateQueu
 	return s.SQS.CreateQueue(ctx, in)
 }
 
-// Ensure the awsclient import is used (the Subscription type is used in the
-// paginated-list test above). If the import is unused the compiler will
-// flag it; this comment is here for clarity only.
+
