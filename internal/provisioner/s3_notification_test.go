@@ -470,6 +470,9 @@ func TestEnsureBucketNotification_FallbackMatchesUnIDedEntry(t *testing.T) {
 		t.Fatalf("expected fallback match to update in place, got %d configs", len(out.Configuration.TopicConfigurations))
 	}
 	tc := out.Configuration.TopicConfigurations[0]
+	if tc.ID == "" {
+		t.Error("expected fallback match to replace the legacy entry with a managed ID")
+	}
 	if tc.TopicArn != topicARN || tc.Filter == nil || tc.Filter.Prefix != "legacy/" {
 		t.Errorf("unexpected configuration state after fallback update: %+v", tc)
 	}
