@@ -426,6 +426,55 @@ func TestEnsureBucketNotification_MatchesByIDPrecedenceOverTopicARN(t *testing.T
 	}
 }
 
+func TestEnsureBucketNotification_FallbackMatchesUnIDedEntry(t *testing.T) {
+	ctx := t.Context()
+	s3Fake := fake.NewS3()
+	snsFake := fake.NewSNS()
+
+	topicARN := "arn:aws:sns:us-east-1:123456789012:legacy-topic"
+	_, err := s3Fake.PutBucketNotificationConfiguration(ctx, awsclient.PutBucketNotificationConfigurationInput{
+		Bucket: "test-bucket",
+		Configuration: awsclient.NotificationConfiguration{
+			TopicConfigurations: []awsclient.TopicConfiguration{
+				{
+					// Empty ID — simulates a notification entry created outside Weir (CLI, console)
+					TopicArn: topicARN,
+					Events:   []string{"s3:ObjectCreated:*"},
+					Filter:   &awsclient.NotificationFilter{Prefix: "legacy/"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	cfg := provisioner.BucketNotificationConfig{
+		Bucket:   "test-bucket",
+		TopicARN: topicARN,
+		Prefix:   "legacy/",
+	}
+
+	if err := provisioner.EnsureBucketNotification(ctx, s3Fake, snsFake, cfg); err != nil {
+		t.Fatalf("EnsureBucketNotification failed: %v", err)
+	}
+
+	out, err := s3Fake.GetBucketNotificationConfiguration(ctx, awsclient.GetBucketNotificationConfigurationInput{
+		Bucket: "test-bucket",
+	})
+	if err != nil {
+		t.Fatalf("get config failed: %v", err)
+	}
+
+	if len(out.Configuration.TopicConfigurations) != 1 {
+		t.Fatalf("expected fallback match to update in place, got %d configs", len(out.Configuration.TopicConfigurations))
+	}
+	tc := out.Configuration.TopicConfigurations[0]
+	if tc.TopicArn != topicARN || tc.Filter == nil || tc.Filter.Prefix != "legacy/" {
+		t.Errorf("unexpected configuration state after fallback update: %+v", tc)
+	}
+}
+
 func TestEnsureBucketNotification_MultiplePipelinesSameBucket(t *testing.T) {
 	ctx := t.Context()
 	s3Fake := fake.NewS3()

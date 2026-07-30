@@ -67,12 +67,14 @@ func EnsureBucketNotification(ctx context.Context, s3 awsclient.S3Client, sns aw
 	if err != nil {
 		return fmt.Errorf("provisioner: merge SNS topic policy: %w", err)
 	}
-	if _, err := sns.SetTopicAttributes(ctx, awsclient.SetTopicAttributesInput{
-		TopicArn:       cfg.TopicARN,
-		AttributeName:  "Policy",
-		AttributeValue: policy,
-	}); err != nil {
-		return fmt.Errorf("provisioner: set SNS topic policy for %q: %w", cfg.TopicARN, err)
+	if policy != topicAttrs.Attributes["Policy"] {
+		if _, err := sns.SetTopicAttributes(ctx, awsclient.SetTopicAttributesInput{
+			TopicArn:       cfg.TopicARN,
+			AttributeName:  "Policy",
+			AttributeValue: policy,
+		}); err != nil {
+			return fmt.Errorf("provisioner: set SNS topic policy for %q: %w", cfg.TopicARN, err)
+		}
 	}
 
 	// ── 2. Derive stable ID and desired configuration ─────────────────────────

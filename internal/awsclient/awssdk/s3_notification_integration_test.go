@@ -116,13 +116,16 @@ func TestEnsureBucketNotificationAgainstLocalStack(t *testing.T) {
 			t.Fatalf("ReceiveMessage: %v", err)
 		}
 		if len(recOut.Messages) > 0 {
-			receivedMessage = recOut.Messages[0].Body
-			// Delete received message
+			msgBody := recOut.Messages[0].Body
+			// Delete received message so it doesn't remain in queue
 			_, _ = clients.SQS.DeleteMessage(ctx, awsclient.DeleteMessageInput{
 				QueueUrl:      qSet.MainQueueURL,
 				ReceiptHandle: recOut.Messages[0].ReceiptHandle,
 			})
-			break
+			if strings.Contains(msgBody, objectKey) {
+				receivedMessage = msgBody
+				break
+			}
 		}
 	}
 
