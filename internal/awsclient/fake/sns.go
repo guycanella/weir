@@ -16,6 +16,8 @@ const (
 	SNSMethodCreateTopic              = "CreateTopic"
 	SNSMethodSubscribe                = "Subscribe"
 	SNSMethodListSubscriptionsByTopic = "ListSubscriptionsByTopic"
+	SNSMethodGetTopicAttributes       = "GetTopicAttributes"
+	SNSMethodSetTopicAttributes       = "SetTopicAttributes"
 )
 
 // ErrInvalidNextToken is returned by ListSubscriptionsByTopic when the
@@ -33,6 +35,7 @@ const defaultListPageSize = 100
 //
 // Topics records every created topic's ARN, keyed by name.
 // Subscriptions records every subscription created, keyed by topic ARN.
+// TopicAttributes records attributes set via SetTopicAttributes, keyed by topic ARN.
 //
 // ListPageSize caps how many subscriptions ListSubscriptionsByTopic
 // returns per call, mirroring real SNS's pagination; zero/unset defaults
@@ -42,8 +45,9 @@ const defaultListPageSize = 100
 type SNS struct {
 	mu sync.Mutex
 
-	Topics        map[string]string
-	Subscriptions map[string][]awsclient.Subscription
+	Topics          map[string]string
+	Subscriptions   map[string][]awsclient.Subscription
+	TopicAttributes map[string]map[string]string
 
 	ListPageSize int
 
@@ -54,9 +58,10 @@ type SNS struct {
 // NewSNS returns an empty, ready-to-use SNS fake.
 func NewSNS() *SNS {
 	return &SNS{
-		Topics:        make(map[string]string),
-		Subscriptions: make(map[string][]awsclient.Subscription),
-		errs:          newErrorQueue(),
+		Topics:          make(map[string]string),
+		Subscriptions:   make(map[string][]awsclient.Subscription),
+		TopicAttributes: make(map[string]map[string]string),
+		errs:            newErrorQueue(),
 	}
 }
 
@@ -155,4 +160,37 @@ func (f *SNS) ListSubscriptionsByTopic(_ context.Context, in awsclient.ListSubsc
 	}
 
 	return awsclient.ListSubscriptionsByTopicOutput{Subscriptions: page, NextToken: nextToken}, nil
+}
+
+// GetTopicAttributes implements awsclient.SNSClient.
+func (f *SNS) GetTopicAttributes(_ context.Context, in awsclient.GetTopicAttributesInput) (awsclient.GetTopicAttributesOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.errs.next(SNSMethodGetTopicAttributes); err != nil {
+		return awsclient.GetTopicAttributesOutput{}, err
+	}
+
+	stored := f.TopicAttributes[in.TopicArn]
+	attributes := make(map[string]string, len(stored))
+	for name, value := range stored {
+		attributes[name] = value
+	}
+	return awsclient.GetTopicAttributesOutput{Attributes: attributes}, nil
+}
+
+// SetTopicAttributes implements awsclient.SNSClient.
+func (f *SNS) SetTopicAttributes(_ context.Context, in awsclient.SetTopicAttributesInput) (awsclient.SetTopicAttributesOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.errs.next(SNSMethodSetTopicAttributes); err != nil {
+		return awsclient.SetTopicAttributesOutput{}, err
+	}
+
+	if _, ok := f.TopicAttributes[in.TopicArn]; !ok {
+		f.TopicAttributes[in.TopicArn] = make(map[string]string)
+	}
+	f.TopicAttributes[in.TopicArn][in.AttributeName] = in.AttributeValue
+	return awsclient.SetTopicAttributesOutput{}, nil
 }

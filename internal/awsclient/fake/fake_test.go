@@ -523,6 +523,8 @@ func TestMethodNameConstantsMatchRealMethodNames(t *testing.T) {
 				fake.SNSMethodCreateTopic,
 				fake.SNSMethodSubscribe,
 				fake.SNSMethodListSubscriptionsByTopic,
+				fake.SNSMethodGetTopicAttributes,
+				fake.SNSMethodSetTopicAttributes,
 			},
 		},
 		{
