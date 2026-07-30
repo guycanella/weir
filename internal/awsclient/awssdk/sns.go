@@ -70,3 +70,33 @@ func (a *SNS) ListSubscriptionsByTopic(ctx context.Context, in awsclient.ListSub
 		NextToken:     aws.ToString(out.NextToken),
 	}, nil
 }
+
+// GetTopicAttributes implements awsclient.SNSClient.
+func (a *SNS) GetTopicAttributes(ctx context.Context, in awsclient.GetTopicAttributesInput) (awsclient.GetTopicAttributesOutput, error) {
+	out, err := a.client.GetTopicAttributes(ctx, &sns.GetTopicAttributesInput{
+		TopicArn: aws.String(in.TopicArn),
+	})
+	if err != nil {
+		return awsclient.GetTopicAttributesOutput{}, fmt.Errorf("awssdk: GetTopicAttributes: %w", err)
+	}
+
+	attributes := make(map[string]string, len(out.Attributes))
+	for name, value := range out.Attributes {
+		attributes[name] = value
+	}
+	return awsclient.GetTopicAttributesOutput{Attributes: attributes}, nil
+}
+
+// SetTopicAttributes implements awsclient.SNSClient.
+func (a *SNS) SetTopicAttributes(ctx context.Context, in awsclient.SetTopicAttributesInput) (awsclient.SetTopicAttributesOutput, error) {
+	_, err := a.client.SetTopicAttributes(ctx, &sns.SetTopicAttributesInput{
+		TopicArn:       aws.String(in.TopicArn),
+		AttributeName:  aws.String(in.AttributeName),
+		AttributeValue: aws.String(in.AttributeValue),
+	})
+	if err != nil {
+		return awsclient.SetTopicAttributesOutput{}, fmt.Errorf("awssdk: SetTopicAttributes: %w", err)
+	}
+
+	return awsclient.SetTopicAttributesOutput{}, nil
+}

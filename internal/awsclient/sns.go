@@ -19,6 +19,15 @@ type SNSClient interface {
 	// caller can check whether one already exists before subscribing again
 	// (WR-018's idempotent "ensure" semantics).
 	ListSubscriptionsByTopic(ctx context.Context, in ListSubscriptionsByTopicInput) (ListSubscriptionsByTopicOutput, error)
+
+	// GetTopicAttributes reads a topic's attributes, including its resource
+	// policy, so reconcilers can update the statements they own without
+	// destroying unrelated permissions (WR-019).
+	GetTopicAttributes(ctx context.Context, in GetTopicAttributesInput) (GetTopicAttributesOutput, error)
+
+	// SetTopicAttributes sets an attribute on an SNS topic, e.g. "Policy"
+	// allowing S3 bucket notifications to publish (WR-019).
+	SetTopicAttributes(ctx context.Context, in SetTopicAttributesInput) (SetTopicAttributesOutput, error)
 }
 
 // CreateTopicInput names the topic to create.
@@ -74,3 +83,23 @@ type Subscription struct {
 	Endpoint        string
 	TopicArn        string
 }
+
+// GetTopicAttributesInput identifies the topic whose attributes should be read.
+type GetTopicAttributesInput struct {
+	TopicArn string
+}
+
+// GetTopicAttributesOutput carries all attributes returned by SNS.
+type GetTopicAttributesOutput struct {
+	Attributes map[string]string
+}
+
+// SetTopicAttributesInput identifies the topic and the attribute name/value to set.
+type SetTopicAttributesInput struct {
+	TopicArn       string
+	AttributeName  string
+	AttributeValue string
+}
+
+// SetTopicAttributesOutput carries no data on success.
+type SetTopicAttributesOutput struct{}
