@@ -1,8 +1,8 @@
 name: CI
 
 # Base CI skeleton (WR-005): lint, build, unit tests on every PR and on
-# pushes to main. The kind + LocalStack integration job is out of scope
-# here — that lands in WR-053.
+# pushes to main. WR-020 adds the LocalStack-only integration job below.
+# The full kind + LocalStack cluster job is out of scope here — that lands in WR-053.
 on:
   pull_request:
   push:
@@ -67,3 +67,54 @@ jobs:
 
       - name: Test
         run: make test
+
+  test-integration:
+    name: integration tests (LocalStack)
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a # 4.14.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,sns,sqs
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 15s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Wait for LocalStack
+        run: |
+          for i in $(seq 1 20); do
+            health=$(curl -sf http://localhost:4566/_localstack/health || true)
+            if echo "$health" | grep -q '"s3": "available"' && \
+               echo "$health" | grep -q '"sns": "available"' && \
+               echo "$health" | grep -q '"sqs": "available"'; then
+              echo "LocalStack ready (s3, sns, sqs available)"; exit 0
+            fi
+            echo "Waiting for LocalStack ($i)..."; sleep 2
+          done
+          echo "LocalStack did not become ready in time" >&2
+          exit 1
+
+      - name: Integration tests
+        run: |
+          AWS_ENDPOINT_URL=http://localhost:4566 \
+          AWS_REGION=us-east-2 \
+          AWS_ACCESS_KEY_ID=test \
+          AWS_SECRET_ACCESS_KEY=test \
+          AWS_PROFILE= \
+          AWS_EC2_METADATA_DISABLED=true \
+          go test -tags=integration ./internal/awsclient/awssdk/... -count=1
