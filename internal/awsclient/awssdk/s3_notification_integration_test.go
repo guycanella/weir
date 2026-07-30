@@ -10,6 +10,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/guycanella/weir/internal/awsclient"
 	"github.com/guycanella/weir/internal/provisioner"
@@ -35,11 +36,17 @@ func TestEnsureBucketNotificationAgainstLocalStack(t *testing.T) {
 	objectKey := watchedPrefix + "test-file.txt"
 
 	// 1. Create S3 Bucket
-	_, err := rawS3.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(bucketName),
-	})
-	if err != nil {
-		t.Fatalf("CreateBucket(%q): %v", bucketName, err)
+	// Outside us-east-1, S3 requires an explicit LocationConstraint;
+	// LocalStack enforces this too (mirrors createTestBucket in smoke_integration_test.go).
+	_, region := localStackEnv(t)
+	createBucketIn := &s3.CreateBucketInput{Bucket: aws.String(bucketName)}
+	if region != "us-east-1" {
+		createBucketIn.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(region),
+		}
+	}
+	if _, err := rawS3.CreateBucket(ctx, createBucketIn); err != nil {
+		t.Fatalf("CreateBucket(%q) in region %q: %v", bucketName, region, err)
 	}
 
 	queueCfg := provisioner.QueueConfig{
