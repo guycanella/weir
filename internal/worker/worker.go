@@ -103,10 +103,11 @@ func (w Worker) Run(recvCtx context.Context) error {
 				return err
 			}
 
-			if err := w.Process(workCtx, msg); err != nil {
-				if err := shutdownTimeoutErr(workCtx, out.Messages, i); err != nil {
-					return err
-				}
+			processErr := w.Process(workCtx, msg)
+			if err := shutdownTimeoutErr(workCtx, out.Messages, i); err != nil {
+				return err
+			}
+			if processErr != nil {
 				continue
 			}
 
