@@ -120,6 +120,9 @@ func (w Worker) Run(recvCtx context.Context) error {
 				}
 				continue
 			}
+			if err := shutdownTimeoutErr(workCtx, out.Messages, i+1); err != nil {
+				return err
+			}
 		}
 
 		if recvCtx.Err() != nil {
