@@ -14,7 +14,9 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/guycanella/weir/internal/awsclient"
 	"github.com/guycanella/weir/internal/worker"
@@ -27,14 +29,26 @@ import (
 // ordering bug missed — shutdownTimeoutErr was only ever checked on the
 // DeleteMessage *error* path, never unconditionally after a successful
 // delete.
+//
+// entered, if non-nil, is closed as the FIRST action of the first
+// DeleteMessage call — before it starts waiting. That gives the test a
+// happens-before edge it can synchronize on ("the delete is now in flight
+// and parked") instead of assuming the scheduler resumes Run's per-message
+// goroutine before the grace timer could fire.
 type blockingDeleteSQS struct {
 	awsclient.SQSClient
+
+	entered chan struct{}
+	once    sync.Once
 }
 
 func (b *blockingDeleteSQS) DeleteMessage(
 	ctx context.Context,
 	in awsclient.DeleteMessageInput,
 ) (awsclient.DeleteMessageOutput, error) {
+	if b.entered != nil {
+		b.once.Do(func() { close(b.entered) })
+	}
 	<-ctx.Done()
 	return b.SQSClient.DeleteMessage(ctx, in)
 }
@@ -42,9 +56,17 @@ func (b *blockingDeleteSQS) DeleteMessage(
 // TestProcessReturnsNilAfterGraceExpiry: the second message's processor
 // blocks until the grace timer fires (observed via workCtx.Done()), then
 // returns nil — success — rather than propagating workCtx.Err(). Even so,
-// Run must treat the batch as timed out: the message must NOT be deleted,
-// the third message must never be started, and Run must return an error
-// wrapping ErrShutdownTimeout.
+// Run must treat the run as timed out: the message must NOT be deleted, no
+// further message may be started, and Run must return an error wrapping
+// ErrShutdownTimeout.
+//
+// Concurrency stays at the default 1, so under WR-022's capacity-capped
+// receive each ReceiveMessage asks for exactly one message: m1 and m2 arrive
+// from two separate calls and m3 is never checked out at all. Shutdown is
+// requested from the test goroutine once m2 is provably holding the only
+// slot — see TestShutdownGraceExpiresMidBatch's comment for why cancelling
+// from inside a processor would make the counts scheduling-dependent now that
+// free capacity gates the receive call.
 func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 3)
@@ -54,7 +76,10 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var processed []string
+	var (
+		processed []string
+		blocked   = make(chan struct{})
+	)
 
 	w := worker.New(worker.Worker{
 		SQSClient:     rec,
@@ -65,14 +90,14 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 
 			switch len(processed) {
 			case 1:
-				// First message completes normally, then shutdown is
-				// requested — this starts the single grace timer.
-				cancel()
+				// First message completes normally and is deleted, before
+				// shutdown is requested.
 				return nil
 			case 2:
 				// Block until the grace period expires, then report
 				// success (nil) instead of propagating the cancellation —
 				// this is the exact case the ordering bug missed.
+				close(blocked)
 				<-workCtx.Done()
 				return nil
 			default:
@@ -81,7 +106,18 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 		},
 	})
 
-	err := runWorker(t, w, ctx, cancel)
+	done := startWorker(w, ctx)
+
+	select {
+	case <-blocked:
+	case <-time.After(runTimeout):
+		t.Error("the second message was never started, so the late-nil case was never exercised")
+		abandonRun(done, cancel)
+		return
+	}
+	cancel() // the single grace timer starts here and can only expire
+
+	err := awaitRun(t, done, cancel)
 
 	if err == nil {
 		t.Fatal("Run returned nil, want an error wrapping ErrShutdownTimeout — a nil return from Process must not bypass the shutdown-timeout check")
@@ -89,8 +125,10 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 	if !errors.Is(err, worker.ErrShutdownTimeout) {
 		t.Fatalf("Run returned %v, want an error wrapping worker.ErrShutdownTimeout", err)
 	}
-	if !mentionsCount(err.Error(), 2) {
-		t.Errorf("shutdown-timeout error %q does not report the remaining message count (2 of the 3-message batch were left unprocessed)", err.Error())
+	// Two messages checked out, only m1 deleted: the late nil must leave its
+	// message counted as unprocessed.
+	if !mentionsCounts(err.Error(), 1, 2) {
+		t.Errorf("shutdown-timeout error %q does not report 1 of the 2 received messages left unprocessed — a nil that arrived after the budget was gone is not a completion", err.Error())
 	}
 
 	if want := []string{"m1", "m2"}; !equalStrings(processed, want) {
@@ -99,8 +137,11 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 	if got := deletedBodies(f, queueURL); !equalStrings(got, []string{"m1"}) {
 		t.Errorf("deleted %v, want [m1] — the message that returned nil only after grace expiry must NOT be deleted", got)
 	}
-	if got := rec.receiveCount(); got != 1 {
-		t.Errorf("ReceiveMessage called %d time(s), want exactly 1", got)
+	if got := len(f.Received[queueURL]); got != 2 {
+		t.Errorf("%d message(s) were checked out of the queue, want exactly 2 — the third must never be claimed once the budget is gone", got)
+	}
+	if got := rec.receiveCount(); got != 2 {
+		t.Errorf("ReceiveMessage called %d time(s), want exactly 2 — one free slot means one message per call, and no call may follow grace expiry", got)
 	}
 }
 
@@ -108,14 +149,37 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 // TestProcessReturnsNilAfterGraceExpiry: DeleteMessage for the first message
 // blocks until the grace timer fires, then reports success (nil) — a delete
 // that completes right as/after the deadline — rather than an error. Even
-// so, Run must treat the batch as timed out: the second message must never
-// be started, and Run must return an error wrapping ErrShutdownTimeout
-// instead of falling through to the next iteration.
+// so, Run must treat the run as timed out: the second message must never be
+// started, and Run must return an error wrapping ErrShutdownTimeout instead
+// of falling through to the next iteration.
+//
+// The delete that lands late still counts as a delete — the message really is
+// gone from the queue, so calling it unprocessed would over-report
+// redeliveries — which is why the reported figure here is "0 of 1" rather
+// than "1 of 1". The load-bearing claim is that a successful delete does not
+// suppress the timeout error: everything received happened to be deleted, and
+// Run must STILL say the budget expired.
+//
+// Under WR-022's capacity-capped receive that single message is the only one
+// ever checked out: Concurrency is the default 1, and the one token stays held
+// by the processor blocked inside DeleteMessage until the watchdog fires, at
+// which point the receive loop's acquire fails for good. m2 and m3 are
+// therefore never claimed, which is why "1 of 3 messages received" became "1
+// of 1" without weakening what the test proves.
+//
+// Shutdown is requested from the test goroutine only once DeleteMessage has
+// provably been entered and is parked. Cancelling from inside Process would
+// leave the outcome scheduling-dependent: nothing would guarantee the delete
+// is reached before the grace timer expires, and a late-resuming goroutine
+// would see ErrShutdownTimeout already set on its pre-delete check and skip
+// the delete entirely, turning "0 of 1" into "1 of 1" for reasons that have
+// nothing to do with the behaviour under test.
 func TestDeleteReturnsNilAfterGraceExpiry(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 3)
 
-	rec := &recordingSQS{SQSClient: &blockingDeleteSQS{SQSClient: f}}
+	deleteEntered := make(chan struct{})
+	rec := &recordingSQS{SQSClient: &blockingDeleteSQS{SQSClient: f, entered: deleteEntered}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -127,19 +191,25 @@ func TestDeleteReturnsNilAfterGraceExpiry(t *testing.T) {
 		QueueURL:      queueURL,
 		ShutdownGrace: shortGrace,
 		Process: func(_ context.Context, msg awsclient.Message) error {
+			// Completing normally hands the message to DeleteMessage, which
+			// blocks inside blockingDeleteSQS until the grace timer fires.
 			processed = append(processed, msg.Body)
-
-			if len(processed) == 1 {
-				// Completing normally starts the single grace timer.
-				// DeleteMessage for this same message will then block on
-				// blockingDeleteSQS until that timer fires.
-				cancel()
-			}
 			return nil
 		},
 	})
 
-	err := runWorker(t, w, ctx, cancel)
+	done := startWorker(w, ctx)
+
+	select {
+	case <-deleteEntered:
+	case <-time.After(runTimeout):
+		t.Error("DeleteMessage was never entered, so the late-nil delete case was never exercised")
+		abandonRun(done, cancel)
+		return
+	}
+	cancel() // the single grace timer starts here and can only expire
+
+	err := awaitRun(t, done, cancel)
 
 	if err == nil {
 		t.Fatal("Run returned nil, want an error wrapping ErrShutdownTimeout — a nil return from DeleteMessage must not bypass the shutdown-timeout check")
@@ -147,8 +217,8 @@ func TestDeleteReturnsNilAfterGraceExpiry(t *testing.T) {
 	if !errors.Is(err, worker.ErrShutdownTimeout) {
 		t.Fatalf("Run returned %v, want an error wrapping worker.ErrShutdownTimeout", err)
 	}
-	if !mentionsCount(err.Error(), 2) {
-		t.Errorf("shutdown-timeout error %q does not report the remaining message count (2 of the 3-message batch were left unprocessed)", err.Error())
+	if !mentionsCounts(err.Error(), 0, 1) {
+		t.Errorf("shutdown-timeout error %q does not report 0 of the 1 received message left unprocessed — the late delete did succeed, so nothing is awaiting redelivery, and the timeout must be reported anyway", err.Error())
 	}
 
 	if want := []string{"m1"}; !equalStrings(processed, want) {
@@ -156,6 +226,9 @@ func TestDeleteReturnsNilAfterGraceExpiry(t *testing.T) {
 	}
 	if got := deletedBodies(f, queueURL); !equalStrings(got, []string{"m1"}) {
 		t.Errorf("deleted %v, want [m1] — the delete that only completed after grace expiry still succeeded and must be recorded", got)
+	}
+	if got := len(f.Received[queueURL]); got != 1 {
+		t.Errorf("%d message(s) were checked out of the queue, want exactly 1 — the slot is held by the blocked delete until the budget is gone, so nothing else may be claimed", got)
 	}
 	if got := rec.receiveCount(); got != 1 {
 		t.Errorf("ReceiveMessage called %d time(s), want exactly 1", got)
