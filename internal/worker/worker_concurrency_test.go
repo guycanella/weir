@@ -439,9 +439,11 @@ func TestProcessRunsConcurrentlyUpToCap(t *testing.T) {
 }
 
 // TestBurstNeverExceedsConcurrencyCap is WR-022's Done-when ("concurrency
-// cap verified under a burst"). Forty messages — four full receive batches
-// — are all held inside Process at once, so an unbounded implementation
-// races straight to forty in-flight calls while a bounded one parks at two.
+// cap verified under a burst"). Forty messages are queued at once, so an
+// unbounded implementation races straight to forty in-flight calls while a
+// bounded one parks at two. The capacity-capped receive means the burst
+// arrives in batches of at most `concurrency` messages, not in fixed batches
+// of ten.
 //
 // It also pins a consequence that matters against real SQS: while every
 // slot is busy and the current batch still has unstarted messages, no

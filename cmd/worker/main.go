@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -40,6 +41,10 @@ func parseConcurrency(raw string) int {
 		return 0
 	}
 	n, err := strconv.Atoi(raw)
+	if errors.Is(err, strconv.ErrRange) && n > 0 {
+		// Atoi returns the clamped platform maximum together with ErrRange.
+		return maxConcurrency
+	}
 	if err != nil || n <= 0 {
 		return 0
 	}

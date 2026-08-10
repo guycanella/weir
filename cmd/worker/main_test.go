@@ -17,6 +17,8 @@ func TestParseConcurrency(t *testing.T) {
 		{name: "valid with surrounding whitespace", in: " 4 ", want: 4},
 		{name: "at max", in: "100", want: 100},
 		{name: "above max clamps to max", in: "2000000000", want: 100},
+		{name: "positive overflow clamps to max", in: "99999999999999999999", want: 100},
+		{name: "negative overflow returns zero", in: "-99999999999999999999", want: 0},
 	}
 
 	for _, tc := range tests {

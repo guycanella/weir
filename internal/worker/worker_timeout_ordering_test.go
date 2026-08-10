@@ -14,6 +14,7 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,14 +29,26 @@ import (
 // ordering bug missed — shutdownTimeoutErr was only ever checked on the
 // DeleteMessage *error* path, never unconditionally after a successful
 // delete.
+//
+// entered, if non-nil, is closed as the FIRST action of the first
+// DeleteMessage call — before it starts waiting. That gives the test a
+// happens-before edge it can synchronize on ("the delete is now in flight
+// and parked") instead of assuming the scheduler resumes Run's per-message
+// goroutine before the grace timer could fire.
 type blockingDeleteSQS struct {
 	awsclient.SQSClient
+
+	entered chan struct{}
+	once    sync.Once
 }
 
 func (b *blockingDeleteSQS) DeleteMessage(
 	ctx context.Context,
 	in awsclient.DeleteMessageInput,
 ) (awsclient.DeleteMessageOutput, error) {
+	if b.entered != nil {
+		b.once.Do(func() { close(b.entered) })
+	}
 	<-ctx.Done()
 	return b.SQSClient.DeleteMessage(ctx, in)
 }
@@ -153,11 +166,20 @@ func TestProcessReturnsNilAfterGraceExpiry(t *testing.T) {
 // which point the receive loop's acquire fails for good. m2 and m3 are
 // therefore never claimed, which is why "1 of 3 messages received" became "1
 // of 1" without weakening what the test proves.
+//
+// Shutdown is requested from the test goroutine only once DeleteMessage has
+// provably been entered and is parked. Cancelling from inside Process would
+// leave the outcome scheduling-dependent: nothing would guarantee the delete
+// is reached before the grace timer expires, and a late-resuming goroutine
+// would see ErrShutdownTimeout already set on its pre-delete check and skip
+// the delete entirely, turning "0 of 1" into "1 of 1" for reasons that have
+// nothing to do with the behaviour under test.
 func TestDeleteReturnsNilAfterGraceExpiry(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 3)
 
-	rec := &recordingSQS{SQSClient: &blockingDeleteSQS{SQSClient: f}}
+	deleteEntered := make(chan struct{})
+	rec := &recordingSQS{SQSClient: &blockingDeleteSQS{SQSClient: f, entered: deleteEntered}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -169,19 +191,25 @@ func TestDeleteReturnsNilAfterGraceExpiry(t *testing.T) {
 		QueueURL:      queueURL,
 		ShutdownGrace: shortGrace,
 		Process: func(_ context.Context, msg awsclient.Message) error {
+			// Completing normally hands the message to DeleteMessage, which
+			// blocks inside blockingDeleteSQS until the grace timer fires.
 			processed = append(processed, msg.Body)
-
-			if len(processed) == 1 {
-				// Completing normally starts the single grace timer.
-				// DeleteMessage for this same message will then block on
-				// blockingDeleteSQS until that timer fires.
-				cancel()
-			}
 			return nil
 		},
 	})
 
-	err := runWorker(t, w, ctx, cancel)
+	done := startWorker(w, ctx)
+
+	select {
+	case <-deleteEntered:
+	case <-time.After(runTimeout):
+		t.Error("DeleteMessage was never entered, so the late-nil delete case was never exercised")
+		abandonRun(done, cancel)
+		return
+	}
+	cancel() // the single grace timer starts here and can only expire
+
+	err := awaitRun(t, done, cancel)
 
 	if err == nil {
 		t.Fatal("Run returned nil, want an error wrapping ErrShutdownTimeout — a nil return from DeleteMessage must not bypass the shutdown-timeout check")
