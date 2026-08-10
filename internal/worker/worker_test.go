@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,8 +55,13 @@ const (
 	// hang.
 	runTimeout = 10 * time.Second
 
-	// wantMaxMessages / wantWaitTime are WR-021's fixed receive settings
-	// (ROADMAP_WR-021.md, "Worker API").
+	// wantMaxMessages is SQS's hard ceiling on MaxNumberOfMessages, and so
+	// the largest value the worker may ever request. It is NOT the value it
+	// always requests: since WR-022 the request is capped to the number of
+	// concurrency slots that are actually free (see
+	// TestReceiveRequestsOnlyFreeSlots), so a worker at the default
+	// Concurrency of 1 asks for exactly one message. wantWaitTime is the
+	// long-poll duration, which concurrency does not touch.
 	wantMaxMessages int32 = 10
 	wantWaitTime    int32 = 20
 )
@@ -179,6 +185,17 @@ func mentionsCount(msg string, want int) bool {
 	return regexp.MustCompile(`(^|[^0-9])` + strconv.Itoa(want) + `([^0-9]|$)`).MatchString(msg)
 }
 
+// mentionsCounts is mentionsCount for the "<unprocessed> of <received>" pair
+// the shutdown-timeout error reports. Asserting both numbers separately is
+// far too weak once they are small: "1 of 2" satisfies mentionsCount(1) and
+// mentionsCount(2) — and so does "2 of 1". This pins the two numbers AND
+// their order without pinning the wording between them.
+func mentionsCounts(msg string, first, second int) bool {
+	return regexp.MustCompile(
+		`(^|[^0-9])` + strconv.Itoa(first) + `\D+` + strconv.Itoa(second) + `([^0-9]|$)`,
+	).MatchString(msg)
+}
+
 // ── tests ───────────────────────────────────────────────────────────────
 
 // TestRunConsumesAllMessages is the happy path: every message in the batch
@@ -223,12 +240,19 @@ func TestRunConsumesAllMessages(t *testing.T) {
 	}
 }
 
-// TestReceiveUsesLongPollSettings pins WR-021's fixed receive
-// configuration: a batch of 10, a 20-second long poll, the configured
-// queue URL, and — deliberately — no VisibilityTimeout override, which
-// belongs to WR-024. Without this, the worker could silently degrade to
-// short polling (burning API calls and defeating scale-to-zero economics)
-// with every other test still green.
+// TestReceiveUsesLongPollSettings pins the receive configuration: a
+// 20-second long poll, the configured queue URL, and — deliberately — no
+// VisibilityTimeout override, which belongs to WR-024. Without this, the
+// worker could silently degrade to short polling (burning API calls and
+// defeating scale-to-zero economics) with every other test still green.
+//
+// The batch size is no longer a fixed 10: WR-022's review established that
+// the worker must never ask for messages it has no free slot to start, so
+// the request is capped to the free-slot count. This worker leaves
+// Concurrency unset, i.e. the default of 1, so it must ask for exactly one
+// message. The cap is exercised across concurrency levels in
+// TestReceiveRequestsOnlyFreeSlots; what this test pins is that capping the
+// batch size did not disturb the long-poll settings around it.
 func TestReceiveUsesLongPollSettings(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 1)
@@ -260,8 +284,9 @@ func TestReceiveUsesLongPollSettings(t *testing.T) {
 	if got.QueueUrl != queueURL {
 		t.Errorf("ReceiveMessage QueueUrl = %q, want %q", got.QueueUrl, queueURL)
 	}
-	if got.MaxNumberOfMessages != wantMaxMessages {
-		t.Errorf("ReceiveMessage MaxNumberOfMessages = %d, want %d", got.MaxNumberOfMessages, wantMaxMessages)
+	// One free slot (the default Concurrency), therefore one message.
+	if got.MaxNumberOfMessages != 1 {
+		t.Errorf("ReceiveMessage MaxNumberOfMessages = %d, want 1 — at the default Concurrency of 1 exactly one slot is free, and a bigger request would check out messages the worker cannot start", got.MaxNumberOfMessages)
 	}
 	if got.WaitTimeSeconds != wantWaitTime {
 		t.Errorf("ReceiveMessage WaitTimeSeconds = %d, want %d (long polling)", got.WaitTimeSeconds, wantWaitTime)
@@ -364,23 +389,47 @@ func TestCancelDuringReceive(t *testing.T) {
 // two-context model: SIGTERM stops NEW receives without abandoning the
 // batch SQS already handed over. Abandoning it would be visible in
 // production as duplicate work after the visibility timeout elapsed.
+//
+// Concurrency is set to 5 — matching the seeded message count — so that the
+// whole batch still arrives from a SINGLE ReceiveMessage under WR-022's
+// capacity-capped request (the request is bounded by the free-slot count, so
+// at Concurrency=1 the same five messages would take five receive calls and
+// the "one batch handed over, then cancellation" framing this test exists to
+// pin would dissolve into five unrelated one-message batches).
+//
+// Above Concurrency=1 the five processors run in parallel, so the ORDER in
+// which bodies are seen is scheduling, not behavior: the drain claim is
+// therefore asserted as a multiset. What stays exact is the count — all five
+// messages of the handed-over batch complete and are deleted — and the claim
+// that cancellation stopped further work from being CHECKED OUT, which is
+// asserted on the messages SQS actually handed back rather than on the
+// number of calls: an extra receive may still be issued in the instant
+// before cancellation becomes visible to the loop, but with the queue now
+// empty it can hand back nothing, and against real SQS a receive on a
+// canceled context fails without checking anything out.
 func TestCancelAfterReceiveDrainsCurrentBatch(t *testing.T) {
+	const batch = 5
+
 	f, queueURL := newFakeQueue(t)
-	seed(t, f, queueURL, 5)
+	seed(t, f, queueURL, batch)
 
 	rec := &recordingSQS{SQSClient: f}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var processed []string
+	var (
+		processed bodyLog // several goroutines: a plain slice would race
+		entered   atomic.Int64
+	)
 	w := worker.New(worker.Worker{
 		SQSClient:     rec,
 		QueueURL:      queueURL,
 		ShutdownGrace: longGrace,
+		Concurrency:   batch,
 		Process: func(workCtx context.Context, msg awsclient.Message) error {
-			processed = append(processed, msg.Body)
-			if len(processed) == 1 {
+			processed.add(msg.Body)
+			if entered.Add(1) == 1 {
 				// Shutdown requested with four messages still to go.
 				cancel()
 			}
@@ -396,14 +445,17 @@ func TestCancelAfterReceiveDrainsCurrentBatch(t *testing.T) {
 		t.Fatalf("Run returned %v, want nil", err)
 	}
 
-	if want := []string{"m1", "m2", "m3", "m4", "m5"}; !equalStrings(processed, want) {
-		t.Errorf("processed %v, want %v — the in-flight batch must be drained after cancellation", processed, want)
+	if got, want := processed.snapshot(), bodySet(batch); !sortedEqual(got, want) {
+		t.Errorf("processed %v, want %v — the in-flight batch must be drained after cancellation", got, want)
 	}
-	if got := len(f.Deleted[queueURL]); got != 5 {
-		t.Errorf("deleted %d message(s), want 5: %v", got, f.Deleted[queueURL])
+	if got := len(f.Deleted[queueURL]); got != batch {
+		t.Errorf("deleted %d message(s), want %d: %v", got, batch, f.Deleted[queueURL])
 	}
-	if got := rec.receiveCount(); got != 1 {
-		t.Errorf("ReceiveMessage called %d time(s), want exactly 1 — no new receive may start after cancellation", got)
+	if got := len(f.Received[queueURL]); got != batch {
+		t.Errorf("%d message(s) were checked out of the queue over the whole run, want exactly the %d of the in-flight batch — cancellation must not let a further message be claimed", got, batch)
+	}
+	if got := rec.receiveCount(); got < 1 {
+		t.Errorf("ReceiveMessage called %d time(s), want at least the one that handed over the batch", got)
 	}
 }
 
@@ -411,10 +463,28 @@ func TestCancelAfterReceiveDrainsCurrentBatch(t *testing.T) {
 // shared. When it expires, cooperative processing must observe
 // cancellation whose Cause is ErrShutdownTimeout (NOT
 // context.DeadlineExceeded — WithCancelCause reports context.Canceled and
-// preserves the cause separately), the remaining messages must not be
-// started, and Run must report a distinct timeout error carrying the
-// number of messages left. Without the sentinel, a caller could not tell
-// "we ran out of time" from "processing failed".
+// preserves the cause separately), no further message may be started, and
+// Run must report a distinct timeout error carrying the number of messages
+// left. Without the sentinel, a caller could not tell "we ran out of time"
+// from "processing failed".
+//
+// Concurrency stays at the default 1, which keeps the message ordering this
+// test reasons about deterministic. Under WR-022's capacity-capped receive
+// that means one message per ReceiveMessage: m1 (which completes and is
+// deleted) and m2 (the cooperative long-running one) therefore arrive from
+// two separate calls, and m3 is never even checked out — which is the
+// stronger form of "not started", since an unreceived message has no
+// visibility timeout running.
+//
+// Shutdown is requested from the TEST goroutine, once m2 has announced that
+// it holds the only slot, rather than from inside m1's processor as before.
+// That is what makes the expected counts exact: with capacity now gating the
+// receive call, a cancel issued from inside a processor also frees that
+// processor's slot moments later, so the loop can legitimately check out one
+// more message before it observes the cancellation — the counts would be
+// scheduling-dependent. Cancelling while the single slot is held by work that
+// only returns on cancellation leaves the loop parked in acquire with nothing
+// to claim, so the grace period can only expire.
 func TestShutdownGraceExpiresMidBatch(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 3)
@@ -428,6 +498,7 @@ func TestShutdownGraceExpiresMidBatch(t *testing.T) {
 		processed  []string
 		observed   error // the cause the blocked processor saw
 		blockedCtx context.Context
+		blocked    = make(chan struct{})
 	)
 
 	w := worker.New(worker.Worker{
@@ -439,15 +510,15 @@ func TestShutdownGraceExpiresMidBatch(t *testing.T) {
 
 			switch len(processed) {
 			case 1:
-				// First message completes normally, then shutdown is
-				// requested — this starts the single grace timer.
-				cancel()
+				// First message completes normally and is deleted, well
+				// before shutdown is requested.
 				return nil
 			case 2:
 				// Cooperative long-running work: block until the grace
 				// period cancels the work context. No sleep, no race —
 				// this returns only once the timer has fired.
 				blockedCtx = workCtx
+				close(blocked)
 				<-workCtx.Done()
 				observed = context.Cause(workCtx)
 				return workCtx.Err()
@@ -457,7 +528,20 @@ func TestShutdownGraceExpiresMidBatch(t *testing.T) {
 		},
 	})
 
-	err := runWorker(t, w, ctx, cancel)
+	done := startWorker(w, ctx)
+
+	// Handshake, not a sleep: the only slot is provably occupied by work that
+	// will not return until the watchdog fires.
+	select {
+	case <-blocked:
+	case <-time.After(runTimeout):
+		t.Error("the second message was never started, so grace expiry was never exercised")
+		abandonRun(done, cancel)
+		return
+	}
+	cancel() // shutdown requested; the single grace timer starts here
+
+	err := awaitRun(t, done, cancel)
 
 	if err == nil {
 		t.Fatal("Run returned nil, want an error wrapping ErrShutdownTimeout")
@@ -465,10 +549,10 @@ func TestShutdownGraceExpiresMidBatch(t *testing.T) {
 	if !errors.Is(err, worker.ErrShutdownTimeout) {
 		t.Fatalf("Run returned %v, want an error wrapping worker.ErrShutdownTimeout", err)
 	}
-	// Two messages (the blocked one and the untouched third) were left at
-	// or after the current batch position.
-	if !mentionsCount(err.Error(), 2) {
-		t.Errorf("shutdown-timeout error %q does not report the remaining message count (2 of the 3-message batch were left unprocessed)", err.Error())
+	// Two messages were checked out over the run; only m1 was deleted, so
+	// exactly one is left for redelivery.
+	if !mentionsCounts(err.Error(), 1, 2) {
+		t.Errorf("shutdown-timeout error %q does not report 1 of the 2 received messages left unprocessed — the blocked message is undeleted and will be redelivered", err.Error())
 	}
 
 	if !errors.Is(observed, worker.ErrShutdownTimeout) {
@@ -484,8 +568,11 @@ func TestShutdownGraceExpiresMidBatch(t *testing.T) {
 	if got := deletedBodies(f, queueURL); !equalStrings(got, []string{"m1"}) {
 		t.Errorf("deleted %v, want [m1] — only the message that finished before the deadline", got)
 	}
-	if got := rec.receiveCount(); got != 1 {
-		t.Errorf("ReceiveMessage called %d time(s), want exactly 1", got)
+	if got := len(f.Received[queueURL]); got != 2 {
+		t.Errorf("%d message(s) were checked out of the queue, want exactly 2 — the third must never be claimed once the budget is gone", got)
+	}
+	if got := rec.receiveCount(); got != 2 {
+		t.Errorf("ReceiveMessage called %d time(s), want exactly 2 — one free slot means one message per call, and no call may follow grace expiry", got)
 	}
 }
 
