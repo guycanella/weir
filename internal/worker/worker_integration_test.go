@@ -302,14 +302,23 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	wantResultKeys := make([]string, 0, itMessageCount)
 	for i := 1; i <= itMessageCount; i++ {
 		key := fmt.Sprintf("wr-021-integration/message-%d.txt", i)
-		body := itSNSBody(t, region, itInputBucket, key, int64(i*100), fmt.Sprintf("%032x", i))
+		// Since WR-023 the output key embeds idempotency.Key(bucket, key,
+		// versionID, etag), so the expectation must be built from the SAME
+		// ETag the body carries — hence the shared variable. VersionID stays
+		// empty on both sides: this fixture emits no versionId.
+		etag := fmt.Sprintf("%032x", i)
+		body := itSNSBody(t, region, itInputBucket, key, int64(i*100), etag)
 		if _, err := clients.SQS.SendMessage(ctx, awsclient.SendMessageInput{
 			QueueUrl: queueURL,
 			Body:     body,
 		}); err != nil {
 			t.Fatalf("fixture SendMessage(%d): %v", i, err)
 		}
-		wantResultKeys = append(wantResultKeys, processing.OutputKey(events.Event{Bucket: itInputBucket, Key: key}))
+		wantResultKeys = append(wantResultKeys, processing.OutputKey(events.Event{
+			Bucket: itInputBucket,
+			Key:    key,
+			ETag:   etag,
+		}))
 	}
 	sort.Strings(wantResultKeys)
 

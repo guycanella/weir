@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/guycanella/weir/internal/events"
+	"github.com/guycanella/weir/internal/idempotency"
 )
 
 // This file pins the two PURE helpers of the package (ADR-003: functional
@@ -19,8 +20,10 @@ import (
 
 // TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix pins the derivation:
 // the result object is namespaced under the SOURCE BUCKET, keeps the source
-// object's full path, and gains ResultSuffix — i.e.
-// "<bucket>/<key>" + ResultSuffix.
+// object's full path, then gains the event's IDENTITY KEY as one final path
+// segment and ResultSuffix — i.e.
+//
+//	"<bucket>/<key>/" + idempotency.Key(bucket, key, versionID, etag) + ResultSuffix
 //
 // Why this convention, over the alternatives:
 //
@@ -32,131 +35,221 @@ import (
 //   - Mirroring the path makes provenance obvious to a human browsing the
 //     output bucket, and makes two different source objects structurally
 //     incapable of colliding on one result object.
+//   - Embedding the identity key (WR-008's idempotency.Key over bucket, key,
+//     versionID and etag) extends that injectivity from (bucket, key) to the
+//     full WRITE identity, which is the unit the dedup store already treats as
+//     distinct. Without it, two genuinely different writes to one object key
+//     are two fresh events that both land on ONE output object — and because
+//     the queue is standard rather than FIFO, delivery order is not guaranteed,
+//     so an older write's event can arrive last and silently overwrite the
+//     newer result. Reusing the existing hash keeps this to a single opaque,
+//     already-tested segment rather than new key-derivation logic here.
 //   - Appending a suffix (rather than reusing the key verbatim) means that if
 //     someone ever misconfigures OutputBucket to equal the input bucket, the
 //     result at least never overwrites the very object it was derived from.
 //     It is NOT a defense against the notification loop that misconfiguration
 //     would cause — preventing that belongs to the infra layer's prefix/
 //     suffix filters — just a cheap way to avoid destroying the input.
-//   - It is a pure function of (Bucket, Key) alone, so it is stable across
-//     redeliveries: the second delivery of an event derives the same output
-//     key, which is what makes the write idempotent even in the window where
-//     the dedup store has not yet answered.
+//   - It is a pure function of the four identity fields alone, so it is stable
+//     across redeliveries: a redelivery carries the same bucket, key, version
+//     and etag by definition, so the second delivery derives the same output
+//     key. That is what makes the write idempotent even in the window where the
+//     dedup store has not yet answered.
+//
+// The path-shaped half of that contract is spelled out literally per case; the
+// hash segment is computed by calling idempotency.Key, since re-deriving
+// SHA-256 by hand here would test that package, not this one. What is under
+// test is OutputKey's STRUCTURE — bucket, then the mirrored key path, then the
+// identity segment, then the suffix.
 func TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix(t *testing.T) {
 	cases := []struct {
 		name string
 		key  string
-		want string
+		// wantPath is the "<bucket>/<key>" prefix the result must sit under,
+		// written out literally so a change to the path-mirroring half of the
+		// derivation is caught by an explicit expectation.
+		wantPath string
 	}{
 		{
-			name: "nested key keeps its full path",
-			key:  "raw/video1.mp4",
-			want: inputBucket + "/raw/video1.mp4" + ResultSuffix,
+			name:     "nested key keeps its full path",
+			key:      "raw/video1.mp4",
+			wantPath: inputBucket + "/raw/video1.mp4",
 		},
 		{
-			name: "top-level key",
-			key:  "video1.mp4",
-			want: inputBucket + "/video1.mp4" + ResultSuffix,
+			name:     "top-level key",
+			key:      "video1.mp4",
+			wantPath: inputBucket + "/video1.mp4",
 		},
 		{
-			name: "deeply nested key",
-			key:  "raw/2026/07/24/video1.mp4",
-			want: inputBucket + "/raw/2026/07/24/video1.mp4" + ResultSuffix,
+			name:     "deeply nested key",
+			key:      "raw/2026/07/24/video1.mp4",
+			wantPath: inputBucket + "/raw/2026/07/24/video1.mp4",
 		},
 		{
-			name: "key with spaces (already URL-decoded by the parser) is used literally",
-			key:  "raw/my file name.mp4",
-			want: inputBucket + "/raw/my file name.mp4" + ResultSuffix,
+			name:     "key with spaces (already URL-decoded by the parser) is used literally",
+			key:      "raw/my file name.mp4",
+			wantPath: inputBucket + "/raw/my file name.mp4",
 		},
 		{
-			name: "key with no extension",
-			key:  "raw/video1",
-			want: inputBucket + "/raw/video1" + ResultSuffix,
+			name:     "key with no extension",
+			key:      "raw/video1",
+			wantPath: inputBucket + "/raw/video1",
 		},
 		{
-			name: "non-ASCII key is preserved byte for byte",
-			key:  "raw/vídeo–1.mp4",
-			want: inputBucket + "/raw/vídeo–1.mp4" + ResultSuffix,
+			name:     "non-ASCII key is preserved byte for byte",
+			key:      "raw/vídeo–1.mp4",
+			wantPath: inputBucket + "/raw/vídeo–1.mp4",
 		},
 		{
-			name: "the suffix is appended unconditionally, even to a key that already ends in it",
-			key:  "raw/video1.mp4" + ResultSuffix,
-			want: inputBucket + "/raw/video1.mp4" + ResultSuffix + ResultSuffix,
+			name:     "the suffix is appended unconditionally, even to a key that already ends in it",
+			key:      "raw/video1.mp4" + ResultSuffix,
+			wantPath: inputBucket + "/raw/video1.mp4" + ResultSuffix,
 		},
 		{
-			name: "empty key (out of contract for the parser, but the function stays total)",
-			key:  "",
-			want: inputBucket + "/" + ResultSuffix,
+			name:     "empty key (out of contract for the parser, but the function stays total)",
+			key:      "",
+			wantPath: inputBucket + "/",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := OutputKey(events.Event{Bucket: inputBucket, Key: tc.key})
-			if got != tc.want {
-				t.Errorf("OutputKey(bucket=%q, key=%q) = %q, want %q", inputBucket, tc.key, got, tc.want)
+			// VersionID and ETag are left zero here: this test is about the
+			// path shape, and TestOutputKeyDependsOnTheWriteIdentityOnly
+			// covers their effect.
+			evt := events.Event{Bucket: inputBucket, Key: tc.key}
+			want := tc.wantPath + "/" + idempotency.Key(inputBucket, tc.key, "", "") + ResultSuffix
+
+			got := OutputKey(evt)
+			if got != want {
+				t.Errorf("OutputKey(bucket=%q, key=%q) = %q, want %q", inputBucket, tc.key, got, want)
+			}
+			if !strings.HasPrefix(got, tc.wantPath+"/") {
+				t.Errorf("OutputKey = %q, want it to mirror the source path under prefix %q", got, tc.wantPath+"/")
+			}
+			if !strings.HasSuffix(got, ResultSuffix) {
+				t.Errorf("OutputKey = %q, want it to end in ResultSuffix (%q)", got, ResultSuffix)
 			}
 		})
 	}
 }
 
-// TestOutputKeyDependsOnBucketAndKeyOnly pins both halves of the derivation's
-// contract, which pull in opposite directions and are therefore easy to get
-// half-right:
+// TestOutputKeyEmbedsTheIdentityKeyAsOneOpaqueSegment pins the shape of the
+// segment between the mirrored source path and the suffix: exactly one path
+// segment, exactly the identity key WR-008 defines. Two things would quietly
+// break here — reaching for a different hash (which would make the output key
+// and the dedup key disagree about what "the same write" is) and emitting a
+// segment containing "/" (which would deepen the output prefix tree
+// unpredictably and stop the segment from being recognizable as one unit).
+func TestOutputKeyEmbedsTheIdentityKeyAsOneOpaqueSegment(t *testing.T) {
+	evt := putEvent(t, objectPut{key: "raw/video1.mp4", size: 5, etag: "abc123", versionID: "v42"})
+
+	got := OutputKey(evt)
+	prefix := evt.Bucket + "/" + evt.Key + "/"
+	if !strings.HasPrefix(got, prefix) || !strings.HasSuffix(got, ResultSuffix) {
+		t.Fatalf("OutputKey = %q, want %q + <identity segment> + %q", got, prefix, ResultSuffix)
+	}
+
+	segment := strings.TrimSuffix(strings.TrimPrefix(got, prefix), ResultSuffix)
+	if want := idempotency.Key(evt.Bucket, evt.Key, evt.VersionID, evt.ETag); segment != want {
+		t.Errorf("identity segment = %q, want idempotency.Key(bucket, key, versionID, etag) = %q — the "+
+			"output key and the dedup key must agree on what identifies a write, so reuse that function "+
+			"rather than hashing again here", segment, want)
+	}
+	if strings.Contains(segment, "/") {
+		t.Errorf("identity segment %q contains a %q; it must be a single path segment", segment, "/")
+	}
+}
+
+// TestOutputKeyDependsOnTheWriteIdentityOnly pins both halves of the
+// derivation's contract, which pull in opposite directions and are therefore
+// easy to get half-right:
 //
-//   - It DEPENDS on Bucket as well as Key. Two events carrying the same object
-//     key from different source buckets are different objects and must resolve
-//     to different result objects; collapsing them would mean one silently
-//     overwriting the other's result in a shared output bucket.
-//   - It IGNORES every other field. A redelivery may legitimately carry a
-//     different EventTime (and a re-upload a different Size/ETag/VersionID),
-//     and all of those must still resolve to the same output object, so even a
-//     double write is an overwrite rather than a duplicate result.
-func TestOutputKeyDependsOnBucketAndKeyOnly(t *testing.T) {
-	t.Run("a different source bucket yields a different output key", func(t *testing.T) {
-		const sharedKey = "raw/video1.mp4"
+//   - It DEPENDS on all four IDENTITY fields: Bucket, Key, VersionID, ETag.
+//     Two events differing in any of them are different writes, and must
+//     resolve to different result objects. Collapsing them means one result
+//     silently overwriting another's — across buckets that share an object key,
+//     or, on a versioned bucket, across two writes to one key where the queue
+//     is free to deliver the older event last.
+//   - It IGNORES everything that is NOT identity: Size, EventName, EventTime.
+//     A redelivery of the SAME write may legitimately carry a different
+//     EventTime, and it must still resolve to the same output object, so a
+//     double write is an idempotent overwrite rather than a second result.
+//     This is the same identity/metadata split idempotency.Key makes, and it
+//     must stay in lockstep with it.
+func TestOutputKeyDependsOnTheWriteIdentityOnly(t *testing.T) {
+	base := events.Event{
+		Bucket:    inputBucket,
+		Key:       "raw/video1.mp4",
+		Size:      1,
+		ETag:      "etag-a",
+		VersionID: "v1",
+		EventName: "ObjectCreated:Put",
+		EventTime: mustTime(t, eventTimeStr),
+	}
 
-		a := OutputKey(events.Event{Bucket: "bucket-a", Key: sharedKey})
-		b := OutputKey(events.Event{Bucket: "bucket-b", Key: sharedKey})
+	distinguishing := map[string]struct {
+		mutate func(*events.Event)
+		why    string
+	}{
+		"a different source bucket": {
+			mutate: func(e *events.Event) { e.Bucket = "another-bucket" },
+			why: "two source buckets holding the same object key are different objects; sharing one output " +
+				"key means one bucket's result silently overwrites the other's in a shared output bucket",
+		},
+		"a different object key": {
+			mutate: func(e *events.Event) { e.Key = "raw/video2.mp4" },
+			why:    "two different objects must never share one result object",
+		},
+		"a different version id": {
+			mutate: func(e *events.Event) { e.VersionID = "v2" },
+			why: "two versions of one object key are two distinct writes (the dedup store treats them as " +
+				"such, so both are processed); the queue is standard, not FIFO, so the older version's " +
+				"event may be delivered LAST and would overwrite the newer result with a stale one",
+		},
+		"a different etag": {
+			mutate: func(e *events.Event) { e.ETag = "etag-b" },
+			why: "a differing ETag is a different write even on an unversioned bucket, where VersionID is " +
+				"empty and is therefore the only thing distinguishing the two",
+		},
+	}
 
-		if a == b {
-			t.Errorf("OutputKey collapsed two source buckets onto one output key (%q) for the shared object "+
-				"key %q; the derivation must namespace by Bucket, or one bucket's result silently overwrites "+
-				"the other's in a shared output bucket", a, sharedKey)
-		}
-	})
+	for name, tc := range distinguishing {
+		t.Run(name+" yields a different output key", func(t *testing.T) {
+			other := base
+			tc.mutate(&other)
 
-	t.Run("every field besides bucket and key is ignored", func(t *testing.T) {
-		a := events.Event{
-			Bucket:    inputBucket,
-			Key:       "raw/video1.mp4",
-			Size:      1,
-			ETag:      "etag-a",
-			VersionID: "v1",
-			EventName: "ObjectCreated:Put",
-			EventTime: mustTime(t, eventTimeStr),
-		}
-		b := events.Event{
-			Bucket:    inputBucket,
-			Key:       "raw/video1.mp4",
-			Size:      999,
-			ETag:      "etag-b",
-			VersionID: "v2",
-			EventName: "ObjectCreated:CompleteMultipartUpload",
-			EventTime: mustTime(t, eventTimeStr).Add(time.Hour),
-		}
+			if got, want := OutputKey(other), OutputKey(base); got == want {
+				t.Errorf("OutputKey collapsed two distinct writes onto one output key (%q): %s", got, tc.why)
+			}
+		})
+	}
 
-		if got, want := OutputKey(b), OutputKey(a); got != want {
-			t.Errorf("OutputKey differs (%q vs %q) for two events sharing a bucket and object key; the "+
-				"derivation must depend on Bucket and Key alone, so redeliveries and re-writes land on the "+
-				"same output object", got, want)
-		}
-	})
+	nonIdentity := map[string]func(*events.Event){
+		"size":      func(e *events.Event) { e.Size = 999 },
+		"eventName": func(e *events.Event) { e.EventName = "ObjectCreated:CompleteMultipartUpload" },
+		"eventTime": func(e *events.Event) { e.EventTime = mustTime(t, eventTimeStr).Add(time.Hour) },
+	}
+
+	for field, mutate := range nonIdentity {
+		t.Run("a different "+field+" yields the same output key", func(t *testing.T) {
+			other := base
+			mutate(&other)
+
+			if got, want := OutputKey(other), OutputKey(base); got != want {
+				t.Errorf("OutputKey differs (%q vs %q) for two events of the SAME write that differ only in "+
+					"%s; that field is metadata, not identity — a redelivery can carry a different one, and "+
+					"it must still land on the same output object", got, want, field)
+			}
+		})
+	}
 
 	t.Run("a zero-value event is still total", func(t *testing.T) {
 		// Out of contract for the parser, but the function must not panic or
-		// depend on either field being non-empty.
-		if got, want := OutputKey(events.Event{}), "/"+ResultSuffix; got != want {
+		// depend on any field being non-empty. Both separators are still
+		// emitted, so the empty bucket and the empty key collapse to "//".
+		want := "/" + "/" + idempotency.Key("", "", "", "") + ResultSuffix
+		if got := OutputKey(events.Event{}); got != want {
 			t.Errorf("OutputKey(zero value) = %q, want %q — the derivation must stay total", got, want)
 		}
 	})
@@ -165,7 +258,8 @@ func TestOutputKeyDependsOnBucketAndKeyOnly(t *testing.T) {
 // TestOutputKeyIsDeterministic states the property directly: repeated calls
 // on the same event never differ. A derivation that reached for a timestamp
 // or a random suffix would produce a new result object per delivery and make
-// the Done-when unverifiable.
+// the Done-when unverifiable. Embedding the identity key does not weaken this:
+// idempotency.Key is itself pure and deterministic.
 func TestOutputKeyIsDeterministic(t *testing.T) {
 	evt := putEvent(t, objectPut{key: "raw/video1.mp4", size: 5, etag: "t", versionID: "v"})
 

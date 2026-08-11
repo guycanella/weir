@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/guycanella/weir/internal/events"
+	"github.com/guycanella/weir/internal/idempotency"
 )
 
 // DefaultContentType is the Content-Type used for a result object when
@@ -17,13 +18,32 @@ const ResultSuffix = ".result.json"
 
 // OutputKey derives the output-bucket key for evt's result, namespaced by
 // evt.Bucket so that two events with the same object key but different
-// source buckets never collide in a shared output bucket. It is a pure,
-// total, deterministic function: see stub_test.go for the exact contract
-// (nested paths, non-ASCII, an already-suffixed key, the empty key) and
-// helpers_test.go/process_test.go for why the derivation ignores every
-// other field besides evt.Bucket and evt.Key.
+// source buckets never collide in a shared output bucket, and by
+// idempotency.Key(evt.Bucket, evt.Key, evt.VersionID, evt.ETag) so that two
+// events with the same object key but different content (a different
+// VersionID/ETag) never collide either.
+//
+// The VersionID/ETag component is required because this project's SQS queue
+// is standard, not FIFO: delivery order across distinct writes to the same
+// key is not guaranteed. Without it, an older version's event processed
+// after a newer one would silently overwrite the newer result with stale
+// data — a silent, hard-to-detect data-loss bug. Including it means every
+// distinct (bucket, key, versionID, etag) tuple gets its own result object,
+// so an out-of-order redelivery can never clobber a newer result.
+//
+// Because idempotency.Key deliberately excludes EventName/EventTime/Size,
+// redeliveries of the SAME write (which vary only in those fields) still
+// correctly collapse onto a single output key. The tradeoff is that this
+// project no longer has a single stable "latest result" path per source
+// key; unbounded small-object growth in the output bucket over repeated
+// overwrites is an accepted, later-fixable storage/lifecycle concern, not
+// addressed here.
+//
+// It is a pure, total, deterministic function: see stub_test.go for the
+// exact contract (nested paths, non-ASCII, an already-suffixed key, the
+// empty key) and helpers_test.go/process_test.go for further detail.
 func OutputKey(evt events.Event) string {
-	return evt.Bucket + "/" + evt.Key + ResultSuffix
+	return evt.Bucket + "/" + evt.Key + "/" + idempotency.Key(evt.Bucket, evt.Key, evt.VersionID, evt.ETag) + ResultSuffix
 }
 
 // defaultStubResult is the JSON shape DefaultStub produces. It is a plain

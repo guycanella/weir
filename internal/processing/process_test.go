@@ -3,6 +3,8 @@ package processing
 import (
 	"context"
 	"errors"
+	"slices"
+	"sort"
 	"testing"
 
 	"github.com/guycanella/weir/internal/awsclient"
@@ -729,22 +731,30 @@ func TestCallerContextReachesTheStoreAndS3(t *testing.T) {
 
 // --- output key collision semantics ---------------------------------------
 
-// TestTwoVersionsOfTheSameObjectShareOneOutputKey documents an accepted
-// consequence of the chosen output-key derivation (namespace by the source
-// bucket, mirror the source key, append ResultSuffix): the derivation
-// deliberately ignores VersionID, while
-// the idempotency key does not. So two writes to the same object key on a
-// versioned bucket are two distinct events — both fresh, both processed —
-// whose results land on the same output object, the later overwriting the
-// earlier.
+// TestTwoVersionsOfTheSameObjectHaveDistinctOutputKeys pins the other half of
+// "one output object per unit of work": the unit is a distinct WRITE, not a
+// distinct source key. Two writes to the same object key on a versioned bucket
+// are two distinct events by the idempotency key's own definition (it includes
+// VersionID and ETag) — both fresh, both processed — and each must therefore
+// keep its own result object.
 //
-// That is latest-wins, chosen for MVP simplicity: the output key stays
-// predictable and human-readable, which is what the demo and the WR-026
-// end-to-end check need. It does NOT weaken the Done-when — a REDELIVERY of
-// the same version is still written exactly once, which is what
-// TestRedeliveredMessageDoesNotDoubleWrite proves. Encoding VersionID into
-// the output key would be the fix if per-version results ever matter.
-func TestTwoVersionsOfTheSameObjectShareOneOutputKey(t *testing.T) {
+// The output-key derivation embeds that same identity key for exactly this
+// reason. Deriving it from (bucket, key) alone would send both results to ONE
+// object, and since the queue is STANDARD, not FIFO, delivery order is not
+// guaranteed: the older version's event can be processed last, silently
+// overwriting the newer result with a stale one and leaving nothing in the
+// output bucket to reveal it. That is data loss, and no amount of predictable
+// naming pays for it.
+//
+// The cost accepted instead is that there is no single stable "latest result"
+// path per source key, and that results accumulate one object per write.
+// Unbounded growth of small objects is a benign storage concern, fixable later
+// with a lifecycle rule or a pointer object; silent data loss is neither.
+//
+// This does not weaken the Done-when: a REDELIVERY of the same write carries
+// the same bucket/key/version/etag, so it derives the same output key and is
+// still written exactly once — see TestRedeliveredMessageDoesNotDoubleWrite.
+func TestTwoVersionsOfTheSameObjectHaveDistinctOutputKeys(t *testing.T) {
 	h := newHarness(t)
 
 	v1 := objectPut{key: "raw/a.mp4", size: 1, etag: "etag-v1", versionID: "v1"}
@@ -761,9 +771,18 @@ func TestTwoVersionsOfTheSameObjectShareOneOutputKey(t *testing.T) {
 		t.Errorf("PutObject was called %d times for two distinct object versions, want 2: they are "+
 			"different writes (different ETag/VersionID), so neither is a duplicate of the other", got)
 	}
-	wantKey := OutputKey(putEvent(t, v1))
-	if got := h.s3.storedKeys(outputBucket); len(got) != 1 || got[0] != wantKey {
-		t.Errorf("output bucket holds %q, want exactly [%q]: the output key mirrors the source bucket+key and "+
-			"ignores VersionID, so the newer result overwrites the older", got, wantKey)
+
+	wantKeys := []string{OutputKey(putEvent(t, v1)), OutputKey(putEvent(t, v2))}
+	if wantKeys[0] == wantKeys[1] {
+		t.Fatalf("OutputKey derived the same key %q for both versions; the derivation must include the "+
+			"write's version identity, or the second result overwrites the first", wantKeys[0])
+	}
+	sort.Strings(wantKeys)
+
+	got := h.s3.storedKeys(outputBucket)
+	if !slices.Equal(got, wantKeys) {
+		t.Errorf("output bucket holds %q, want both results kept at %q: with a standard (non-FIFO) queue "+
+			"the older write's event may arrive last, so collapsing the two onto one key would let a stale "+
+			"result overwrite a newer one", got, wantKeys)
 	}
 }
