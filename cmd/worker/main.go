@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/guycanella/weir/internal/awsclient/awssdk"
 	"github.com/guycanella/weir/internal/processing"
+	"github.com/guycanella/weir/internal/telemetry"
 	"github.com/guycanella/weir/internal/worker"
 )
 
@@ -55,8 +57,19 @@ func parseConcurrency(raw string) int {
 }
 
 func main() {
-	logger := slog.Default()
+	logger := newLogger(nil, parseLogLevel(os.Getenv("LOG_LEVEL")))
+	if err := run(logger); err != nil {
+		logger.Error("worker exited with error", "error", err)
+		os.Exit(1)
+	}
+}
 
+// run wires up configuration, telemetry, AWS clients, and the worker, and
+// runs the consume loop to completion. It returns the first error
+// encountered instead of calling os.Exit directly, so every deferred
+// cleanup (signal-context stop, telemetry shutdown) unwinds normally before
+// main decides whether to exit non-zero.
+func run(logger *slog.Logger) error {
 	queueURL := strings.TrimSpace(os.Getenv("QUEUE_URL"))
 	region := strings.TrimSpace(os.Getenv("AWS_REGION"))
 	endpointURL := strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL"))
@@ -64,21 +77,28 @@ func main() {
 	concurrency := parseConcurrency(os.Getenv("WORKER_CONCURRENCY"))
 
 	if queueURL == "" || region == "" || outputBucket == "" {
-		logger.Error("missing required configuration",
-			"QUEUE_URL_set", queueURL != "",
-			"AWS_REGION_set", region != "",
-			"OUTPUT_BUCKET_set", outputBucket != "",
-		)
-		os.Exit(1)
+		return fmt.Errorf("missing required configuration: QUEUE_URL_set=%v AWS_REGION_set=%v OUTPUT_BUCKET_set=%v",
+			queueURL != "", region != "", outputBucket != "")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTelemetry, err := telemetry.Setup(ctx, os.Stderr)
+	if err != nil {
+		return fmt.Errorf("set up telemetry: %w", err)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(flushCtx); err != nil {
+			logger.Warn("shut down telemetry", "error", err)
+		}
+	}()
+
 	clients, err := awssdk.NewClients(ctx, awssdk.Config{Region: region, EndpointURL: endpointURL})
 	if err != nil {
-		logger.Error("build AWS clients", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("build AWS clients: %w", err)
 	}
 
 	process, err := processing.New(processing.Config{
@@ -87,8 +107,7 @@ func main() {
 		Store:        processing.NewInMemoryStore(),
 	})
 	if err != nil {
-		logger.Error("build processing pipeline", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("build processing pipeline: %w", err)
 	}
 
 	logger.Warn("deduplication is in-memory and per-process",
@@ -96,16 +115,22 @@ func main() {
 		"shared_across_replicas", false,
 	)
 
+	instrumentedProcess, err := telemetry.InstrumentProcess(process, telemetry.Config{})
+	if err != nil {
+		return fmt.Errorf("instrument processing pipeline: %w", err)
+	}
+
 	w := worker.New(worker.Worker{
 		SQSClient:     clients.SQS,
 		QueueURL:      queueURL,
 		ShutdownGrace: shutdownGrace,
 		Concurrency:   concurrency,
-		Process:       process,
+		Process:       instrumentedProcess,
 	})
 
 	if err := w.Run(ctx); err != nil {
-		logger.Error("worker exited with error", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("worker run: %w", err)
 	}
+
+	return nil
 }
