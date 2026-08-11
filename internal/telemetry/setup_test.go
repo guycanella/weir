@@ -111,6 +111,69 @@ func TestSetupMakesTracesAndLatencyObservableLocally(t *testing.T) {
 	}
 }
 
+// TestSetupIdentifiesTheWorkerServiceOnEveryExport pins resource attribution.
+// Telemetry that cannot say WHICH service produced it is not usable in a
+// cluster: with no explicit resource the SDK synthesises
+// "unknown_service:<binary name>", so the worker's spans and its metrics
+// arrive anonymous and indistinguishable from anything else's. Both providers
+// need the resource — attaching it to the tracer provider only would leave the
+// latency histogram unattributed, which is the half a dashboard queries.
+//
+// Only service.name is asserted. The SDK's default resource
+// (telemetry.sdk.*) must survive too, which is why this checks for their
+// presence rather than for an exact attribute set: replacing the default
+// resource instead of merging into it would silently drop them.
+func TestSetupIdentifiesTheWorkerServiceOnEveryExport(t *testing.T) {
+	out, shutdown := installGlobals(t)
+
+	wrapped, err := InstrumentProcess(func(context.Context, awsclient.Message) error { return nil }, Config{})
+	if err != nil {
+		t.Fatalf("InstrumentProcess: %v", err)
+	}
+	if err := wrapped(context.Background(), testMessage()); err != nil {
+		t.Fatalf("wrapped process: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	docs := decodeExportedDocs(t, out.String())
+
+	var sawSpan, sawMetric bool
+	for _, doc := range docs {
+		switch {
+		case doc.isSpan():
+			sawSpan = true
+		case doc.isMetric():
+			sawMetric = true
+		default:
+			continue
+		}
+
+		got, ok := doc.resourceAttr("service.name")
+		if !ok {
+			t.Errorf("exported document (span=%v) carries no string service.name resource attribute; every span and metric must name the emitting service (resource: %+v)", doc.isSpan(), doc.Resource)
+			continue
+		}
+		if got != wantServiceName {
+			t.Errorf("exported document (span=%v) service.name = %q, want %q", doc.isSpan(), got, wantServiceName)
+		}
+		if _, ok := doc.resourceAttr("telemetry.sdk.language"); !ok {
+			t.Errorf("exported document (span=%v) lost the SDK's default resource attributes; the explicit resource must be MERGED into resource.Default(), not replace it (resource: %+v)", doc.isSpan(), doc.Resource)
+		}
+	}
+
+	if !sawSpan {
+		t.Errorf("no span document was exported, so span resource attribution was never checked\n--- output ---\n%s", out.String())
+	}
+	if !sawMetric {
+		t.Errorf("no metric document was exported, so metric resource attribution was never checked\n--- output ---\n%s", out.String())
+	}
+}
+
 // TestSetupDefaultsToStdoutWhenGivenANilWriter pins the production default so
 // cmd/worker does not have to name os.Stdout. Nothing is recorded here, so
 // this does not pollute the test log.

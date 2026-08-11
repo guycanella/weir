@@ -2,6 +2,10 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -76,6 +80,15 @@ const (
 	// messaging semantic-convention key rather than an ad-hoc one.
 	attrMessageID = "messaging.message.id"
 )
+
+// wantServiceName is the service.name every exported span and metric must
+// carry. Without an explicit resource the SDK falls back to
+// "unknown_service:<binary>", which in a cluster means the binary name of
+// whatever happened to be built — useless for filtering "show me the worker's
+// traces" and different in a test binary, a container, and a local build. It
+// is spelled here (not imported from the implementation) so the exported wire
+// value is pinned by the test rather than following a rename.
+const wantServiceName = "weir-worker"
 
 func testMessage() awsclient.Message {
 	return awsclient.Message{
@@ -246,6 +259,76 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return string(b.buf)
+}
+
+// --- reading the stdout exporters' output ---------------------------------
+
+// exportedDoc is the part of the stdout exporters' JSON that a span document
+// and a metric document have in common, plus enough of each to tell them
+// apart. The stdout exporters write one JSON document per Write call, so the
+// whole output is a stream of documents.
+type exportedDoc struct {
+	// Name is set on a span document only.
+	Name string `json:"Name"`
+	// ScopeMetrics is set on a metric document only.
+	ScopeMetrics []json.RawMessage `json:"ScopeMetrics"`
+	// Resource is the resource attribute set, present on both shapes.
+	Resource []struct {
+		Key   string `json:"Key"`
+		Value struct {
+			Type  string `json:"Type"`
+			Value any    `json:"Value"`
+		} `json:"Value"`
+	} `json:"Resource"`
+}
+
+func (d exportedDoc) isSpan() bool   { return d.Name != "" }
+func (d exportedDoc) isMetric() bool { return len(d.ScopeMetrics) > 0 }
+
+// resourceAttr returns the value of a resource attribute on an exported
+// document.
+func (d exportedDoc) resourceAttr(key string) (string, bool) {
+	for _, kv := range d.Resource {
+		if kv.Key == key {
+			s, ok := kv.Value.Value.(string)
+			return s, ok
+		}
+	}
+	return "", false
+}
+
+// decodeExportedDocs parses out as the stream of JSON documents the stdout
+// exporters produce, failing the test on the first document that does not
+// parse.
+//
+// That failure mode is the point, not incidental: two exporters writing the
+// same stream without synchronising produce SPLICED output — half a span
+// object with a metric object wedged inside it — which no downstream log or
+// trace collector can read. A json.Decoder loop over the whole stream is the
+// cheapest honest check that every document came out whole.
+func decodeExportedDocs(t *testing.T, out string) []exportedDoc {
+	t.Helper()
+
+	dec := json.NewDecoder(strings.NewReader(out))
+	var docs []exportedDoc
+	for {
+		var raw json.RawMessage
+		err := dec.Decode(&raw)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("exported output is not a clean stream of JSON documents: %v\nafter %d document(s) parsed; the exporters must not interleave their writes.\n--- output ---\n%s",
+				err, len(docs), out)
+		}
+
+		var doc exportedDoc
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("exported document %d does not match the expected span/metric shape: %v\n--- document ---\n%s", len(docs), err, raw)
+		}
+		docs = append(docs, doc)
+	}
+	return docs
 }
 
 // startedSpanFrom returns the span carried by ctx, for assertions about what

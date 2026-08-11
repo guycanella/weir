@@ -99,7 +99,7 @@ func InstrumentProcess(next worker.ProcessFunc, cfg Config) (worker.ProcessFunc,
 			case r != nil:
 				panicErr := fmt.Errorf("panic: %v", r)
 				span.SetStatus(codes.Error, panicErr.Error())
-				span.RecordError(panicErr)
+				span.RecordError(panicErr, trace.WithStackTrace(true))
 			case err != nil:
 				span.SetStatus(codes.Error, err.Error())
 				span.RecordError(err)

@@ -530,6 +530,25 @@ func TestInstrumentProcessMarksTheSpanFailedOnAPanic(t *testing.T) {
 				if !ok || !strings.Contains(msg.AsString(), tc.wantInDesc) {
 					t.Errorf("exception event message = %q (present=%v), want it to contain the panic value %q", msg.AsString(), ok, tc.wantInDesc)
 				}
+
+				// A panic is a crash, and "panic: assignment to entry in nil
+				// map" without a stack trace does not say WHERE it crashed —
+				// the panic value has already been unwound by the time the
+				// deferred cleanup runs, so unless the stack is captured at
+				// RecordError time (trace.WithStackTrace(true)) it is lost for
+				// good, and whoever reads the trace has to reproduce the crash
+				// to find the line. Only panics get this: a returned error is
+				// an expected outcome whose message is the diagnostic, and
+				// stack-trace capture is not free.
+				st, ok := attrValue(ev.Attributes, "exception.stacktrace")
+				if !ok {
+					t.Errorf("exception event has no %q attribute; a recovered panic must be recorded with trace.WithStackTrace(true), otherwise the trace names the crash but not its location (attributes: %v)",
+						"exception.stacktrace", ev.Attributes)
+					continue
+				}
+				if strings.TrimSpace(st.AsString()) == "" {
+					t.Errorf("exception event %q attribute is empty, want a captured stack trace", "exception.stacktrace")
+				}
 			}
 			if !foundException {
 				t.Errorf("span recorded no \"exception\" event after a panic; the panic was never handed to span.RecordError (events: %v)", span.Events)

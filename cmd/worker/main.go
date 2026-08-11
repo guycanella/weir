@@ -57,7 +57,7 @@ func parseConcurrency(raw string) int {
 }
 
 func main() {
-	logger := newLogger(nil)
+	logger := newLogger(nil, parseLogLevel(os.Getenv("LOG_LEVEL")))
 	if err := run(logger); err != nil {
 		logger.Error("worker exited with error", "error", err)
 		os.Exit(1)
@@ -77,20 +77,15 @@ func run(logger *slog.Logger) error {
 	concurrency := parseConcurrency(os.Getenv("WORKER_CONCURRENCY"))
 
 	if queueURL == "" || region == "" || outputBucket == "" {
-		logger.Error("missing required configuration",
-			"QUEUE_URL_set", queueURL != "",
-			"AWS_REGION_set", region != "",
-			"OUTPUT_BUCKET_set", outputBucket != "",
-		)
-		return errors.New("missing required configuration")
+		return fmt.Errorf("missing required configuration: QUEUE_URL_set=%v AWS_REGION_set=%v OUTPUT_BUCKET_set=%v",
+			queueURL != "", region != "", outputBucket != "")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	shutdownTelemetry, err := telemetry.Setup(ctx, nil)
+	shutdownTelemetry, err := telemetry.Setup(ctx, os.Stderr)
 	if err != nil {
-		logger.Error("set up telemetry", "error", err)
 		return fmt.Errorf("set up telemetry: %w", err)
 	}
 	defer func() {
@@ -103,7 +98,6 @@ func run(logger *slog.Logger) error {
 
 	clients, err := awssdk.NewClients(ctx, awssdk.Config{Region: region, EndpointURL: endpointURL})
 	if err != nil {
-		logger.Error("build AWS clients", "error", err)
 		return fmt.Errorf("build AWS clients: %w", err)
 	}
 
@@ -113,7 +107,6 @@ func run(logger *slog.Logger) error {
 		Store:        processing.NewInMemoryStore(),
 	})
 	if err != nil {
-		logger.Error("build processing pipeline", "error", err)
 		return fmt.Errorf("build processing pipeline: %w", err)
 	}
 
@@ -124,7 +117,6 @@ func run(logger *slog.Logger) error {
 
 	instrumentedProcess, err := telemetry.InstrumentProcess(process, telemetry.Config{})
 	if err != nil {
-		logger.Error("instrument processing pipeline", "error", err)
 		return fmt.Errorf("instrument processing pipeline: %w", err)
 	}
 
