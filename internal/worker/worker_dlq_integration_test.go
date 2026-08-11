@@ -319,7 +319,7 @@ func TestPoisonMessageIsRedrivenToDLQ(t *testing.T) {
 	empty := false
 	for time.Now().Before(emptyDeadline) {
 		visible, inFlight := itQueueCounts(t, ctx, clients, qs.MainQueueURL)
-		lastDepth = fmt.Sprintf("ApproximateNumberOfMessages=%q, ApproximateNumberOfMessagesNotVisible=%q", visible, inFlight)
+		lastDepth = itFormatDepth(visible, inFlight)
 		if visible == "0" && inFlight == "0" {
 			empty = true
 			break
@@ -359,10 +359,13 @@ func TestPoisonMessageIsRedrivenToDLQ(t *testing.T) {
 	}
 }
 
-// itQueueCounts returns a queue's visible and in-flight approximate depths.
-func itQueueCounts(t *testing.T, ctx context.Context, clients *awssdk.Clients, queueURL string) (visible, inFlight string) {
-	t.Helper()
+// itFormatDepth renders visible and in-flight depths for a failure message.
+func itFormatDepth(visible, inFlight string) string {
+	return fmt.Sprintf("ApproximateNumberOfMessages=%q, ApproximateNumberOfMessagesNotVisible=%q", visible, inFlight)
+}
 
+// itFetchQueueCounts issues the depth query and returns any error to the caller.
+func itFetchQueueCounts(ctx context.Context, clients *awssdk.Clients, queueURL string) (visible, inFlight string, err error) {
 	out, err := clients.SQS.GetQueueAttributes(ctx, awsclient.GetQueueAttributesInput{
 		QueueUrl: queueURL,
 		AttributeNames: []string{
@@ -371,9 +374,20 @@ func itQueueCounts(t *testing.T, ctx context.Context, clients *awssdk.Clients, q
 		},
 	})
 	if err != nil {
+		return "", "", err
+	}
+	return out.Attributes["ApproximateNumberOfMessages"], out.Attributes["ApproximateNumberOfMessagesNotVisible"], nil
+}
+
+// itQueueCounts returns a queue's visible and in-flight approximate depths.
+func itQueueCounts(t *testing.T, ctx context.Context, clients *awssdk.Clients, queueURL string) (visible, inFlight string) {
+	t.Helper()
+
+	visible, inFlight, err := itFetchQueueCounts(ctx, clients, queueURL)
+	if err != nil {
 		t.Fatalf("GetQueueAttributes(%q): %v", queueURL, err)
 	}
-	return out.Attributes["ApproximateNumberOfMessages"], out.Attributes["ApproximateNumberOfMessagesNotVisible"]
+	return visible, inFlight
 }
 
 // itQueueDepth renders a queue's depths for a failure message. It reports a
@@ -384,19 +398,11 @@ func itQueueCounts(t *testing.T, ctx context.Context, clients *awssdk.Clients, q
 func itQueueDepth(t *testing.T, ctx context.Context, clients *awssdk.Clients, queueURL string) string {
 	t.Helper()
 
-	out, err := clients.SQS.GetQueueAttributes(ctx, awsclient.GetQueueAttributesInput{
-		QueueUrl: queueURL,
-		AttributeNames: []string{
-			"ApproximateNumberOfMessages",
-			"ApproximateNumberOfMessagesNotVisible",
-		},
-	})
+	visible, inFlight, err := itFetchQueueCounts(ctx, clients, queueURL)
 	if err != nil {
 		return fmt.Sprintf("<GetQueueAttributes(%q) failed: %v>", queueURL, err)
 	}
-	return fmt.Sprintf("ApproximateNumberOfMessages=%q, ApproximateNumberOfMessagesNotVisible=%q",
-		out.Attributes["ApproximateNumberOfMessages"],
-		out.Attributes["ApproximateNumberOfMessagesNotVisible"])
+	return itFormatDepth(visible, inFlight)
 }
 
 // itDeleteQueueByName resolves a queue by NAME and deletes it, tolerating a

@@ -177,8 +177,12 @@ func TestDeletedMessageIsNotRedeliveredAfterVisibilityTimeoutExpiry(t *testing.T
 // would report. Here the same call must return 1 AND hand back the FAILED
 // body specifically, so neither an over-eager nor an inert expiry can pass.
 //
-// Concurrency stays at the default 1, so m1 is processed and deleted strictly
-// before m2 is even received, and no ordering is left to scheduling.
+// Concurrency is pinned to 1 EXPLICITLY, not left to New's default, because
+// this test's assertions depend on it: since WR-022, Process runs in a
+// per-message goroutine, so anything above 1 would both race on the shared
+// body log and make the ["m1", "m2"] order a matter of scheduling. At 1, m1 is
+// processed and deleted strictly before m2 is even received. The log is still
+// mutex-guarded — Process runs off Run's goroutine even at Concurrency 1.
 func TestExpireInFlightRequeuesOnlyUndeletedMessages(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 2)
@@ -188,13 +192,14 @@ func TestExpireInFlightRequeuesOnlyUndeletedMessages(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var processed []string
+	var processed bodyLog
 	w := worker.New(worker.Worker{
 		SQSClient:     f,
 		QueueURL:      queueURL,
+		Concurrency:   1,
 		ShutdownGrace: longGrace,
 		Process: func(_ context.Context, msg awsclient.Message) error {
-			processed = append(processed, msg.Body)
+			processed.add(msg.Body)
 			if msg.Body == "m2" {
 				cancel()
 				return failed
@@ -206,8 +211,8 @@ func TestExpireInFlightRequeuesOnlyUndeletedMessages(t *testing.T) {
 	if err := runWorker(t, w, ctx, cancel); err != nil {
 		t.Fatalf("Run returned %v, want nil — a single processing failure is not a worker failure", err)
 	}
-	if want := []string{"m1", "m2"}; !equalStrings(processed, want) {
-		t.Fatalf("processed %v, want %v", processed, want)
+	if got, want := processed.snapshot(), []string{"m1", "m2"}; !equalStrings(got, want) {
+		t.Fatalf("processed %v, want %v", got, want)
 	}
 	if got := deletedBodies(f, queueURL); !equalStrings(got, []string{"m1"}) {
 		t.Fatalf("deleted %v, want [m1] — only the successful message", got)
