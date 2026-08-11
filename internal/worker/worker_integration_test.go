@@ -45,6 +45,7 @@ import (
 	"github.com/guycanella/weir/internal/awsclient"
 	"github.com/guycanella/weir/internal/awsclient/awssdk"
 	"github.com/guycanella/weir/internal/events"
+	"github.com/guycanella/weir/internal/idempotency"
 	"github.com/guycanella/weir/internal/processing"
 )
 
@@ -53,9 +54,23 @@ const (
 	itEnvRegion      = "AWS_REGION"
 	itFallbackRegion = "us-east-1"
 
-	// itMessageCount is the batch seeded into the queue. Ten is one full
-	// ReceiveMessage batch, so a single receive can (but need not) drain it.
+	// itMessageCount is the number of distinct-object-key messages seeded into
+	// the queue. Ten is one full ReceiveMessage batch, so a single receive can
+	// (but need not) drain it.
 	itMessageCount = 10
+
+	// itSameKeyVersionCount is how many EXTRA messages reuse an existing
+	// message's bucket and object key with a different ETag, standing in for
+	// the same object being overwritten. Two, not one, so the assertion covers
+	// "several versions each keep their own result", not just a single pair.
+	itSameKeyVersionCount = 2
+
+	// itResultPrefix is the fixed prefix processing.OutputKey puts every result
+	// under. It is restated here as a literal on purpose: reconstructing the
+	// expected key from its parts is what lets this test catch a regression in
+	// OutputKey's own logic, which building the expectation by calling
+	// OutputKey could not.
+	itResultPrefix = "results/"
 
 	// itVisibilityTimeout is deliberately short: if the worker receives a
 	// message and fails to delete it, it becomes visible again quickly and
@@ -225,6 +240,40 @@ func itSNSBody(t *testing.T, region, bucket, key string, size int64, etag string
 	return string(envelope)
 }
 
+// itWantResultKey reconstructs the output-bucket key the worker must write for
+// one source write, INDEPENDENTLY of processing.OutputKey.
+//
+// That independence is the point. Deriving the expectation by calling
+// processing.OutputKey — the very function the worker uses — makes the
+// assertion tautological: if OutputKey regressed, both the expectation and the
+// actual object keys would change identically and the test would stay green.
+// Composing the key from its three parts instead (the literal prefix, the
+// exported ResultSuffix constant, and idempotency.Key) means a changed prefix,
+// a missing suffix, or the wrong fields hashed all show up as a mismatch.
+//
+// idempotency.Key is called rather than reimplemented because it is a
+// different, separately unit-tested pure function, and hand-rolling SHA-256
+// here would test the standard library rather than Weir. A bug inside
+// idempotency.Key remains out of this test's reach by design.
+func itWantResultKey(key, versionID, etag string) string {
+	return itResultPrefix + idempotency.Key(itInputBucket, key, versionID, etag) + processing.ResultSuffix
+}
+
+// itUnique returns the distinct values of in, for fixture self-checks that
+// need to know two expectations really did differ.
+func itUnique(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
 // itUniqueName builds a collision-resistant queue name, so repeat and
 // concurrent runs never contend and a leaked queue from an earlier run
 // cannot make a later one pass.
@@ -295,30 +344,67 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	})
 
 	// ── seed the queue ──────────────────────────────────────────────────
-	// Bodies are real SNS-wrapped S3 event notifications, one distinct
-	// object key each: since WR-023 the worker parses the body for real, so
-	// plain text would be a genuine unmarshal error, leave every message
-	// undeleted, and fail the drain.
-	wantResultKeys := make([]string, 0, itMessageCount)
-	for i := 1; i <= itMessageCount; i++ {
-		key := fmt.Sprintf("wr-021-integration/message-%d.txt", i)
-		// Since WR-023 the output key embeds idempotency.Key(bucket, key,
-		// versionID, etag), so the expectation must be built from the SAME
-		// ETag the body carries — hence the shared variable. VersionID stays
-		// empty on both sides: this fixture emits no versionId.
-		etag := fmt.Sprintf("%032x", i)
-		body := itSNSBody(t, region, itInputBucket, key, int64(i*100), etag)
+	// Bodies are real SNS-wrapped S3 event notifications: since WR-023 the
+	// worker parses the body for real, so plain text would be a genuine
+	// unmarshal error, leave every message undeleted, and fail the drain.
+	//
+	// The expected output keys are reconstructed here from the SAME FORMAT the
+	// production derivation uses, but WITHOUT calling processing.OutputKey.
+	// Calling it would make the assertion tautological: the worker derives its
+	// keys with that function too, so a regression inside it — a changed
+	// prefix, a dropped suffix, the wrong fields fed into the hash — would move
+	// both sides of the comparison together and the test would still pass. By
+	// composing the literal prefix, the exported ResultSuffix constant and
+	// idempotency.Key (a different, independently unit-tested pure function),
+	// this reproduces the contract from its parts instead of from the code
+	// under test. A bug inside idempotency.Key itself is still invisible here;
+	// that is internal/idempotency's own suite's job, and this test is not the
+	// place to re-derive SHA-256 by hand.
+	wantResultKeys := make([]string, 0, itMessageCount+itSameKeyVersionCount)
+	seed := func(key, etag string, size int64) {
+		t.Helper()
+		body := itSNSBody(t, region, itInputBucket, key, size, etag)
 		if _, err := clients.SQS.SendMessage(ctx, awsclient.SendMessageInput{
 			QueueUrl: queueURL,
 			Body:     body,
 		}); err != nil {
-			t.Fatalf("fixture SendMessage(%d): %v", i, err)
+			t.Fatalf("fixture SendMessage(%s, etag=%s): %v", key, etag, err)
 		}
-		wantResultKeys = append(wantResultKeys, processing.OutputKey(events.Event{
-			Bucket: itInputBucket,
-			Key:    key,
-			ETag:   etag,
-		}))
+		// VersionID is empty on both sides: this fixture emits no versionId, so
+		// the ETag is the only thing distinguishing two writes to one key —
+		// exactly the unversioned-bucket case.
+		wantResultKeys = append(wantResultKeys, itWantResultKey(key, "", etag))
+	}
+
+	// itMessageCount messages, one distinct object key each.
+	for i := 1; i <= itMessageCount; i++ {
+		seed(fmt.Sprintf("wr-021-integration/message-%d.txt", i), fmt.Sprintf("%032x", i), int64(i*100))
+	}
+
+	// Then itSameKeyVersionCount extra writes that REUSE the first message's
+	// bucket and object key, differing only in ETag (and size) — two later
+	// versions of one object, which is what actually happens when a source
+	// object is overwritten. Without these, every fixture message had a unique
+	// key, so the end-to-end flow never demonstrated that two writes to the
+	// SAME key produce two DISTINCT result objects; that property was only unit
+	// tested in internal/processing. It matters here because the queue is
+	// standard, not FIFO: if the derivation collapsed these onto one output
+	// key, whichever event happened to be processed last would win, and an
+	// older write could silently overwrite a newer result. The full-list
+	// comparison below is what catches it — a collapsing derivation yields
+	// fewer objects than wantResultKeys has entries.
+	sharedKey := "wr-021-integration/message-1.txt"
+	for i := 1; i <= itSameKeyVersionCount; i++ {
+		seed(sharedKey, fmt.Sprintf("overwrite-%032x", i), int64(1000+i))
+	}
+
+	// Guard the fixture against itself: the extra writes must genuinely have
+	// produced extra expected keys, or the assertion below is unchanged from
+	// before and proves nothing new.
+	if got := len(itUnique(wantResultKeys)); got != itMessageCount+itSameKeyVersionCount {
+		t.Fatalf("fixture produced %d distinct expected result keys, want %d: the same-key/different-ETag "+
+			"writes must each get their own result object, or this test cannot detect a derivation that "+
+			"collapses two versions of one object onto a single output key", got, itMessageCount+itSameKeyVersionCount)
 	}
 	sort.Strings(wantResultKeys)
 
@@ -408,9 +494,15 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	// ── the messages were really processed, not just deleted ────────────
 	// A deleted message alone does not prove work happened: the worker also
 	// deletes bodies it recognizes as no-ops. One result object per seeded
-	// key is what distinguishes "drained because processed" from "drained
+	// WRITE is what distinguishes "drained because processed" from "drained
 	// because ignored". The puts precede the deletes, so by the time the
 	// queue reads zero these objects must already be listable.
+	//
+	// The comparison is against the FULL sorted list, so it fails in both
+	// directions: a missing object means a message was deleted without being
+	// processed, and a collapsed pair (fewer objects than writes) means the
+	// same-key/different-ETag writes overwrote each other instead of each
+	// keeping its own result.
 	if gotKeys := itListKeys(t, ctx, rawS3, outBucket); !slices.Equal(gotKeys, wantResultKeys) {
 		t.Errorf("objects in output bucket %q = %q, want %q\nstdout:\n%s\nstderr:\n%s",
 			outBucket, gotKeys, wantResultKeys, stdout.String(), stderr.String())

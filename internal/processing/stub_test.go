@@ -18,146 +18,249 @@ import (
 
 // --- OutputKey -------------------------------------------------------------
 
-// TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix pins the derivation:
-// the result object is namespaced under the SOURCE BUCKET, keeps the source
-// object's full path, then gains the event's IDENTITY KEY as one final path
-// segment and ResultSuffix — i.e.
+// resultPrefix is the fixed prefix every result object must sit under, stated
+// here as a test-side literal so a change to the production prefix has to be
+// a deliberate, visible edit on both sides rather than something the suite
+// follows silently.
+const resultPrefix = "results/"
+
+// wantOutputKeyLen is the exact byte length of every output key OutputKey can
+// ever produce: len("results/") + 64 hex characters of SHA-256 +
+// len(".result.json") = 8 + 64 + 12 = 84. It is a CONSTANT, independent of the
+// source bucket name and object key, which is the whole point of the
+// derivation (see TestOutputKeyIsBoundedRegardlessOfSourceKeyLength).
+const wantOutputKeyLen = len(resultPrefix) + 64 + len(ResultSuffix)
+
+// TestOutputKeyIsTheFixedPrefixPlusTheIdentityHashPlusTheSuffix pins the
+// derivation:
 //
-//	"<bucket>/<key>/" + idempotency.Key(bucket, key, versionID, etag) + ResultSuffix
+//	"results/" + idempotency.Key(bucket, key, versionID, etag) + ResultSuffix
 //
-// Why this convention, over the alternatives:
+// Note what this deliberately does NOT do: it does not mirror the source
+// bucket or object key into the output path. An earlier revision did, which
+// read nicely (provenance was browsable in the output bucket) but was
+// unbounded: S3 allows an object key of up to 1024 bytes and a bucket name of
+// up to 63, so "<bucket>/<key>/<hash>.result.json" could exceed S3's own
+// 1024-byte object-key limit for a perfectly legitimate source object. That
+// failure mode is the worst kind — PutObject rejects the key permanently, so
+// the result can never be written at all, no matter how many times the message
+// is redelivered.
 //
-//   - Namespacing by source bucket is what makes the derivation injective over
-//     (bucket, key). Deriving from the key alone would let two DIFFERENT source
-//     buckets that happen to hold the same object key silently overwrite each
-//     other's results in one shared output bucket — a data-integrity bug, not a
-//     cosmetic one, and invisible from the output bucket afterwards.
-//   - Mirroring the path makes provenance obvious to a human browsing the
-//     output bucket, and makes two different source objects structurally
-//     incapable of colliding on one result object.
-//   - Embedding the identity key (WR-008's idempotency.Key over bucket, key,
-//     versionID and etag) extends that injectivity from (bucket, key) to the
-//     full WRITE identity, which is the unit the dedup store already treats as
-//     distinct. Without it, two genuinely different writes to one object key
-//     are two fresh events that both land on ONE output object — and because
-//     the queue is standard rather than FIFO, delivery order is not guaranteed,
-//     so an older write's event can arrive last and silently overwrite the
-//     newer result. Reusing the existing hash keeps this to a single opaque,
-//     already-tested segment rather than new key-derivation logic here.
-//   - Appending a suffix (rather than reusing the key verbatim) means that if
-//     someone ever misconfigures OutputBucket to equal the input bucket, the
-//     result at least never overwrites the very object it was derived from.
-//     It is NOT a defense against the notification loop that misconfiguration
-//     would cause — preventing that belongs to the infra layer's prefix/
-//     suffix filters — just a cheap way to avoid destroying the input.
-//   - It is a pure function of the four identity fields alone, so it is stable
-//     across redeliveries: a redelivery carries the same bucket, key, version
-//     and etag by definition, so the second delivery derives the same output
-//     key. That is what makes the write idempotent even in the window where the
-//     dedup store has not yet answered.
+// The fixed prefix removes the possibility rather than bounding it by
+// convention: every output key is 84 bytes, always.
 //
-// The path-shaped half of that contract is spelled out literally per case; the
-// hash segment is computed by calling idempotency.Key, since re-deriving
-// SHA-256 by hand here would test that package, not this one. What is under
-// test is OutputKey's STRUCTURE — bucket, then the mirrored key path, then the
-// identity segment, then the suffix.
-func TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix(t *testing.T) {
+// What is PRESERVED from the earlier revision is the part that carried the
+// correctness weight — the identity-hash component, still exactly
+// idempotency.Key over (bucket, key, versionID, etag):
+//
+//   - Including the bucket keeps the derivation injective over (bucket, key),
+//     so two DIFFERENT source buckets holding the same object key cannot
+//     silently overwrite each other's results in one shared output bucket.
+//   - Including versionID and etag extends that injectivity to the full WRITE
+//     identity — the same unit the dedup store treats as distinct. Without it,
+//     two genuinely different writes to one object key would land on ONE output
+//     object, and since the queue is standard rather than FIFO, the older
+//     write's event can arrive last and overwrite the newer result with stale
+//     data.
+//   - Reusing that function (rather than hashing again here) keeps the output
+//     key and the dedup key agreeing on what "the same write" means.
+//
+// Appending a suffix still means that if someone misconfigures OutputBucket to
+// equal the input bucket, the result never overwrites the object it was derived
+// from. It is not a defense against the resulting notification loop — that
+// belongs to the infra layer's prefix/suffix filters — just a cheap way to
+// avoid destroying the input.
+//
+// The table keeps the awkward source keys the earlier path-mirroring version
+// used, but inverts what they prove: those keys must now NOT appear in the
+// output at all, and every one of them must produce a key of the same fixed
+// length. The hash itself is computed by calling idempotency.Key, since
+// re-deriving SHA-256 by hand here would test that package, not this one.
+func TestOutputKeyIsTheFixedPrefixPlusTheIdentityHashPlusTheSuffix(t *testing.T) {
 	cases := []struct {
 		name string
 		key  string
-		// wantPath is the "<bucket>/<key>" prefix the result must sit under,
-		// written out literally so a change to the path-mirroring half of the
-		// derivation is caught by an explicit expectation.
-		wantPath string
 	}{
-		{
-			name:     "nested key keeps its full path",
-			key:      "raw/video1.mp4",
-			wantPath: inputBucket + "/raw/video1.mp4",
-		},
-		{
-			name:     "top-level key",
-			key:      "video1.mp4",
-			wantPath: inputBucket + "/video1.mp4",
-		},
-		{
-			name:     "deeply nested key",
-			key:      "raw/2026/07/24/video1.mp4",
-			wantPath: inputBucket + "/raw/2026/07/24/video1.mp4",
-		},
-		{
-			name:     "key with spaces (already URL-decoded by the parser) is used literally",
-			key:      "raw/my file name.mp4",
-			wantPath: inputBucket + "/raw/my file name.mp4",
-		},
-		{
-			name:     "key with no extension",
-			key:      "raw/video1",
-			wantPath: inputBucket + "/raw/video1",
-		},
-		{
-			name:     "non-ASCII key is preserved byte for byte",
-			key:      "raw/vídeo–1.mp4",
-			wantPath: inputBucket + "/raw/vídeo–1.mp4",
-		},
-		{
-			name:     "the suffix is appended unconditionally, even to a key that already ends in it",
-			key:      "raw/video1.mp4" + ResultSuffix,
-			wantPath: inputBucket + "/raw/video1.mp4" + ResultSuffix,
-		},
-		{
-			name:     "empty key (out of contract for the parser, but the function stays total)",
-			key:      "",
-			wantPath: inputBucket + "/",
-		},
+		{name: "nested key", key: "raw/video1.mp4"},
+		{name: "top-level key", key: "video1.mp4"},
+		{name: "deeply nested key", key: "raw/2026/07/24/video1.mp4"},
+		{name: "key with spaces (already URL-decoded by the parser)", key: "raw/my file name.mp4"},
+		{name: "key with no extension", key: "raw/video1"},
+		{name: "non-ASCII key", key: "raw/vídeo–1.mp4"},
+		{name: "key that already ends in ResultSuffix", key: "raw/video1.mp4" + ResultSuffix},
+		{name: "empty key (out of contract for the parser, but the function stays total)", key: ""},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// VersionID and ETag are left zero here: this test is about the
-			// path shape, and TestOutputKeyDependsOnTheWriteIdentityOnly
-			// covers their effect.
+			// VersionID and ETag are left zero here; their effect on the hash is
+			// covered by TestOutputKeyDependsOnTheWriteIdentityOnly.
 			evt := events.Event{Bucket: inputBucket, Key: tc.key}
-			want := tc.wantPath + "/" + idempotency.Key(inputBucket, tc.key, "", "") + ResultSuffix
+			want := resultPrefix + idempotency.Key(inputBucket, tc.key, "", "") + ResultSuffix
 
 			got := OutputKey(evt)
 			if got != want {
 				t.Errorf("OutputKey(bucket=%q, key=%q) = %q, want %q", inputBucket, tc.key, got, want)
 			}
-			if !strings.HasPrefix(got, tc.wantPath+"/") {
-				t.Errorf("OutputKey = %q, want it to mirror the source path under prefix %q", got, tc.wantPath+"/")
+			if !strings.HasPrefix(got, resultPrefix) {
+				t.Errorf("OutputKey = %q, want it under the fixed prefix %q", got, resultPrefix)
 			}
 			if !strings.HasSuffix(got, ResultSuffix) {
 				t.Errorf("OutputKey = %q, want it to end in ResultSuffix (%q)", got, ResultSuffix)
+			}
+			if len(got) != wantOutputKeyLen {
+				t.Errorf("len(OutputKey) = %d for source key %q, want the fixed %d bytes: the output key's "+
+					"length must not depend on the source key's", len(got), tc.key, wantOutputKeyLen)
+			}
+			// The anti-assertion that replaces the old path-mirroring one: the
+			// source identity must survive only as the opaque hash, never as
+			// literal text. Skipped for the empty key, which every string
+			// trivially contains.
+			if tc.key != "" && strings.Contains(got, tc.key) {
+				t.Errorf("OutputKey = %q still contains the source key %q verbatim; the derivation must not "+
+					"mirror the source path, or a long-but-legal source key can push the output key past "+
+					"S3's 1024-byte object-key limit", got, tc.key)
+			}
+			if strings.Contains(got, inputBucket) {
+				t.Errorf("OutputKey = %q still contains the source bucket %q verbatim; the bucket must reach "+
+					"the output key only through the identity hash", got, inputBucket)
 			}
 		})
 	}
 }
 
+// TestOutputKeyIsBoundedRegardlessOfSourceKeyLength is the boundary case the
+// fixed-prefix derivation exists for. S3's own limits are 1024 bytes for an
+// object key and 63 for a bucket name, so a source object at the very top of
+// its allowance is legal input that Weir must handle — and the path-mirroring
+// derivation this replaced could not: it would have produced an output key of
+// roughly bucket + key + 1 + 64 + 12 bytes, over the 1024-byte limit, making
+// PutObject fail permanently and the result unwritable at any number of
+// retries.
+//
+// Asserting an actual byte bound (not merely "it did not panic") is the point.
+// The 1025-byte case is one byte over S3's limit — input the parser should
+// never see, included to show the bound holds even then, since the derivation
+// makes no assumption about the source key's length at all.
+func TestOutputKeyIsBoundedRegardlessOfSourceKeyLength(t *testing.T) {
+	// s3MaxKeyLen is S3's documented maximum object-key length in bytes; the
+	// output key must stay comfortably under it for every input.
+	const s3MaxKeyLen = 1024
+
+	// maxBucket is a 63-byte bucket name, S3's maximum.
+	maxBucket := strings.Repeat("b", 63)
+
+	cases := []struct {
+		name string
+		evt  events.Event
+	}{
+		{
+			name: "source key at exactly S3's 1024-byte maximum",
+			evt: events.Event{
+				Bucket: inputBucket,
+				Key:    "raw/" + strings.Repeat("a", s3MaxKeyLen-len("raw/.mp4")) + ".mp4",
+				ETag:   "abc123",
+			},
+		},
+		{
+			name: "source key one byte over S3's maximum (out of contract, still bounded)",
+			evt: events.Event{
+				Bucket: inputBucket,
+				Key:    strings.Repeat("a", s3MaxKeyLen+1),
+				ETag:   "abc123",
+			},
+		},
+		{
+			name: "maximum-length bucket AND maximum-length key together, plus a version id",
+			evt: events.Event{
+				Bucket:    maxBucket,
+				Key:       strings.Repeat("a", s3MaxKeyLen),
+				VersionID: strings.Repeat("v", 128),
+				ETag:      strings.Repeat("e", 128),
+			},
+		},
+		{
+			name: "deeply nested maximum-length key",
+			evt: events.Event{
+				Bucket: inputBucket,
+				Key:    strings.TrimSuffix(strings.Repeat("segment/", s3MaxKeyLen/8), "/"),
+				ETag:   "abc123",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Guard the fixture: if the source identity did NOT exceed the limit
+			// when concatenated, this case would prove nothing about the bound.
+			if naive := len(tc.evt.Bucket) + 1 + len(tc.evt.Key) + 1 + 64 + len(ResultSuffix); naive <= s3MaxKeyLen {
+				t.Fatalf("fixture is too short to be a boundary case: a path-mirroring derivation would have "+
+					"produced %d bytes, within S3's %d-byte limit", naive, s3MaxKeyLen)
+			}
+
+			got := OutputKey(tc.evt)
+
+			if len(got) != wantOutputKeyLen {
+				t.Errorf("len(OutputKey) = %d, want the fixed %d bytes; the derivation must not grow with the "+
+					"source key (got %q)", len(got), wantOutputKeyLen, got)
+			}
+			if len(got) >= 200 {
+				t.Errorf("len(OutputKey) = %d for a %d-byte source key, want it well under S3's %d-byte "+
+					"object-key limit (a 200-byte ceiling leaves ample headroom); PutObject rejects an "+
+					"over-long key permanently, so the result could never be written at all",
+					len(got), len(tc.evt.Key), s3MaxKeyLen)
+			}
+			// Still the real derivation, not a truncation of it: the identity
+			// hash must be intact, or bounding the length would have cost
+			// collision-freedom.
+			want := resultPrefix + idempotency.Key(tc.evt.Bucket, tc.evt.Key, tc.evt.VersionID, tc.evt.ETag) + ResultSuffix
+			if got != want {
+				t.Errorf("OutputKey = %q, want %q — the bound must come from dropping the mirrored path, not "+
+					"from truncating the identity hash", got, want)
+			}
+		})
+	}
+
+	// Two maximum-length source keys differing in their LAST byte must still
+	// get different output keys: a derivation that bounded its length by
+	// truncating the source (rather than hashing it) would collapse them and
+	// silently overwrite one result with the other.
+	t.Run("two maximum-length keys differing only at the end stay distinct", func(t *testing.T) {
+		base := strings.Repeat("a", s3MaxKeyLen-1)
+		first := OutputKey(events.Event{Bucket: inputBucket, Key: base + "1", ETag: "t"})
+		second := OutputKey(events.Event{Bucket: inputBucket, Key: base + "2", ETag: "t"})
+		if first == second {
+			t.Errorf("OutputKey collapsed two distinct 1024-byte source keys onto %q; bounding the output "+
+				"key's length must not cost injectivity over the source identity", first)
+		}
+	})
+}
+
 // TestOutputKeyEmbedsTheIdentityKeyAsOneOpaqueSegment pins the shape of the
-// segment between the mirrored source path and the suffix: exactly one path
-// segment, exactly the identity key WR-008 defines. Two things would quietly
-// break here — reaching for a different hash (which would make the output key
-// and the dedup key disagree about what "the same write" is) and emitting a
-// segment containing "/" (which would deepen the output prefix tree
-// unpredictably and stop the segment from being recognizable as one unit).
+// segment between the fixed prefix and the suffix: exactly one path segment,
+// exactly the identity key WR-008 defines. Two things would quietly break here
+// — reaching for a different hash (which would make the output key and the
+// dedup key disagree about what "the same write" is) and emitting a segment
+// containing "/" (which would deepen the output prefix tree unpredictably and
+// stop the segment from being recognizable as one unit).
 func TestOutputKeyEmbedsTheIdentityKeyAsOneOpaqueSegment(t *testing.T) {
 	evt := putEvent(t, objectPut{key: "raw/video1.mp4", size: 5, etag: "abc123", versionID: "v42"})
 
 	got := OutputKey(evt)
-	prefix := evt.Bucket + "/" + evt.Key + "/"
-	if !strings.HasPrefix(got, prefix) || !strings.HasSuffix(got, ResultSuffix) {
-		t.Fatalf("OutputKey = %q, want %q + <identity segment> + %q", got, prefix, ResultSuffix)
+	if !strings.HasPrefix(got, resultPrefix) || !strings.HasSuffix(got, ResultSuffix) {
+		t.Fatalf("OutputKey = %q, want %q + <identity segment> + %q", got, resultPrefix, ResultSuffix)
 	}
 
-	segment := strings.TrimSuffix(strings.TrimPrefix(got, prefix), ResultSuffix)
+	segment := strings.TrimSuffix(strings.TrimPrefix(got, resultPrefix), ResultSuffix)
 	if want := idempotency.Key(evt.Bucket, evt.Key, evt.VersionID, evt.ETag); segment != want {
 		t.Errorf("identity segment = %q, want idempotency.Key(bucket, key, versionID, etag) = %q — the "+
 			"output key and the dedup key must agree on what identifies a write, so reuse that function "+
 			"rather than hashing again here", segment, want)
 	}
 	if strings.Contains(segment, "/") {
-		t.Errorf("identity segment %q contains a %q; it must be a single path segment", segment, "/")
+		t.Errorf("identity segment %q contains a %q; it must be a single path segment, so every result "+
+			"sits directly under %q rather than deepening the prefix tree unpredictably",
+			segment, "/", resultPrefix)
 	}
 }
 
@@ -246,11 +349,16 @@ func TestOutputKeyDependsOnTheWriteIdentityOnly(t *testing.T) {
 
 	t.Run("a zero-value event is still total", func(t *testing.T) {
 		// Out of contract for the parser, but the function must not panic or
-		// depend on any field being non-empty. Both separators are still
-		// emitted, so the empty bucket and the empty key collapse to "//".
-		want := "/" + "/" + idempotency.Key("", "", "", "") + ResultSuffix
-		if got := OutputKey(events.Event{}); got != want {
+		// depend on any field being non-empty. With no mirrored path there is
+		// nothing to collapse: the empty identity still hashes, so even the zero
+		// value yields a well-formed, full-length key.
+		want := resultPrefix + idempotency.Key("", "", "", "") + ResultSuffix
+		got := OutputKey(events.Event{})
+		if got != want {
 			t.Errorf("OutputKey(zero value) = %q, want %q — the derivation must stay total", got, want)
+		}
+		if len(got) != wantOutputKeyLen {
+			t.Errorf("len(OutputKey(zero value)) = %d, want the fixed %d bytes", len(got), wantOutputKeyLen)
 		}
 	})
 }
@@ -272,8 +380,8 @@ func TestOutputKeyIsDeterministic(t *testing.T) {
 	if !strings.HasSuffix(first, ResultSuffix) {
 		t.Errorf("OutputKey = %q, want it to end in ResultSuffix (%q)", first, ResultSuffix)
 	}
-	if !strings.HasPrefix(first, inputBucket+"/") {
-		t.Errorf("OutputKey = %q, want it namespaced under the source bucket (prefix %q)", first, inputBucket+"/")
+	if !strings.HasPrefix(first, resultPrefix) {
+		t.Errorf("OutputKey = %q, want it under the fixed prefix %q", first, resultPrefix)
 	}
 	if first == "" {
 		t.Error("OutputKey returned an empty key")
