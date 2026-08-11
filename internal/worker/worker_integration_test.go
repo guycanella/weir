@@ -162,10 +162,10 @@ func itRawSQSClient(t *testing.T, ctx context.Context) *sqs.Client {
 
 // itRawS3Client builds an S3 client directly, for the same reason
 // itRawSQSClient exists: the fixture needs bucket lifecycle operations
-// (CreateBucket / ListObjectsV2 / DeleteObject / DeleteBucket) that
-// awsclient.S3Client deliberately does not expose. Path-style addressing is
-// required against LocalStack, whose single endpoint cannot serve
-// virtual-host bucket names.
+// (CreateBucket / PutBucketVersioning / ListObjectsV2 / ListObjectVersions /
+// DeleteObject / DeleteBucket) that awsclient.S3Client deliberately does not
+// expose. Path-style addressing is required against LocalStack, whose single
+// endpoint cannot serve virtual-host bucket names.
 func itRawS3Client(t *testing.T, ctx context.Context) *s3.Client {
 	t.Helper()
 
@@ -343,6 +343,29 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 		itDeleteBucket(t, cleanupCtx, rawS3, outBucket)
 	})
 
+	// Versioning on the output bucket is what turns "how many times was this
+	// object written" into an observable fact. It is needed for the duplicate
+	// assertion further down, and nothing else in the test depends on it.
+	//
+	// Why it is necessary: DefaultStub's output is a pure function of the
+	// event's metadata, so a redelivered message that was WRONGLY reprocessed
+	// would PutObject the identical bytes under the identical key. The final
+	// listing (and a GET of the object) would be byte-for-byte the same as if
+	// the duplicate had been correctly skipped, so no assertion over final
+	// state can tell the two apart. With versioning on, each real PutObject
+	// leaves its own version behind: a skipped duplicate leaves one version, a
+	// reprocessed one leaves two, and that difference survives the fact that
+	// both versions have identical content.
+	if _, err := rawS3.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket: aws.String(outBucket),
+		VersioningConfiguration: &s3types.VersioningConfiguration{
+			Status: s3types.BucketVersioningStatusEnabled,
+		},
+	}); err != nil {
+		t.Fatalf("fixture PutBucketVersioning(%q): %v — the duplicate-delivery assertion below needs versioning to count writes", outBucket, err)
+	}
+	itAssertVersioningCountsWrites(t, ctx, rawS3, outBucket)
+
 	// ── seed the queue ──────────────────────────────────────────────────
 	// Bodies are real SNS-wrapped S3 event notifications: since WR-023 the
 	// worker parses the body for real, so plain text would be a genuine
@@ -361,24 +384,44 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	// that is internal/idempotency's own suite's job, and this test is not the
 	// place to re-derive SHA-256 by hand.
 	wantResultKeys := make([]string, 0, itMessageCount+itSameKeyVersionCount)
-	seed := func(key, etag string, size int64) {
+	// send puts one body on the queue verbatim. It is separate from seed so a
+	// genuine duplicate delivery can reuse an ALREADY SENT body without also
+	// registering a new expected result key — a real duplicate must produce no
+	// new object at all.
+	send := func(body, describe string) {
 		t.Helper()
-		body := itSNSBody(t, region, itInputBucket, key, size, etag)
 		if _, err := clients.SQS.SendMessage(ctx, awsclient.SendMessageInput{
 			QueueUrl: queueURL,
 			Body:     body,
 		}); err != nil {
-			t.Fatalf("fixture SendMessage(%s, etag=%s): %v", key, etag, err)
+			t.Fatalf("fixture SendMessage(%s): %v", describe, err)
 		}
+	}
+	// seed sends one message for a distinct source write and records the result
+	// object it must produce. It returns the exact body it sent, so a caller can
+	// later replay that byte-identical body as a redelivery.
+	seed := func(key, etag string, size int64) string {
+		t.Helper()
+		body := itSNSBody(t, region, itInputBucket, key, size, etag)
+		send(body, fmt.Sprintf("%s, etag=%s", key, etag))
 		// VersionID is empty on both sides: this fixture emits no versionId, so
 		// the ETag is the only thing distinguishing two writes to one key —
 		// exactly the unversioned-bucket case.
 		wantResultKeys = append(wantResultKeys, itWantResultKey(key, "", etag))
+		return body
 	}
 
-	// itMessageCount messages, one distinct object key each.
+	// itMessageCount messages, one distinct object key each. The first one's
+	// body and expected result key are kept: that message is the one replayed
+	// verbatim below as a duplicate delivery.
+	var dupBody, dupResultKey string
 	for i := 1; i <= itMessageCount; i++ {
-		seed(fmt.Sprintf("wr-021-integration/message-%d.txt", i), fmt.Sprintf("%032x", i), int64(i*100))
+		key := fmt.Sprintf("wr-021-integration/message-%d.txt", i)
+		etag := fmt.Sprintf("%032x", i)
+		body := seed(key, etag, int64(i*100))
+		if i == 1 {
+			dupBody, dupResultKey = body, itWantResultKey(key, "", etag)
+		}
 	}
 
 	// Then itSameKeyVersionCount extra writes that REUSE the first message's
@@ -398,13 +441,56 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 		seed(sharedKey, fmt.Sprintf("overwrite-%032x", i), int64(1000+i))
 	}
 
-	// Guard the fixture against itself: the extra writes must genuinely have
-	// produced extra expected keys, or the assertion below is unchanged from
-	// before and proves nothing new.
+	// Finally, ONE genuine duplicate delivery: the first message's body, byte
+	// for byte, sent a second time. This is the half of WR-023's Done-when the
+	// fixture above cannot reach — the same-key writes each carry a DIFFERENT
+	// ETag, so each derives a different idempotency key and none of them is a
+	// redelivery of anything. Here bucket, key, versionId and ETag are all
+	// identical, so the idempotency key is identical, and the worker must skip
+	// the second delivery outright.
+	//
+	// Deliberately NOT seed(): a duplicate must add no expected result key. The
+	// object the original delivery wrote is the only one that may exist, which
+	// is why the full-list comparison further down stays exactly as it was.
+	//
+	// This is the wiring-level proof that internal/processing's
+	// TestRedeliveredMessageDoesNotDoubleWrite cannot give: that unit test
+	// drives the dispatch closure directly with fakes, whereas this exercises
+	// the compiled cmd/worker — including the assumption that its dedup store
+	// is built ONCE at startup and shared across messages. A build that
+	// constructed a fresh store per message would satisfy every unit test and
+	// fail only here.
+	send(dupBody, "duplicate delivery of "+sharedKey)
+
+	// Guard the fixture against itself, three ways.
+	//
+	// One: the extra same-key writes must genuinely have produced extra
+	// expected keys, or the full-list assertion is unchanged from before and
+	// proves nothing new.
 	if got := len(itUnique(wantResultKeys)); got != itMessageCount+itSameKeyVersionCount {
 		t.Fatalf("fixture produced %d distinct expected result keys, want %d: the same-key/different-ETag "+
 			"writes must each get their own result object, or this test cannot detect a derivation that "+
 			"collapses two versions of one object onto a single output key", got, itMessageCount+itSameKeyVersionCount)
+	}
+	// Two: the duplicate must NOT have added an expectation. If it ever did
+	// (someone "fixing" it to call seed), wantResultKeys would demand a second
+	// object for an idempotency key that must only ever be written once, and
+	// the test would start asserting the opposite of WR-023's contract.
+	if len(wantResultKeys) != itMessageCount+itSameKeyVersionCount {
+		t.Fatalf("fixture recorded %d expected result keys, want %d: a duplicate delivery must not register "+
+			"an expected result object of its own", len(wantResultKeys), itMessageCount+itSameKeyVersionCount)
+	}
+	// Three: the duplicated body must derive the result key of an ORIGINAL
+	// seeded write. If the replayed body drifted (a different key or ETag) it
+	// would no longer be a redelivery at all — it would be a fresh event, its
+	// one lone version would be entirely expected, and the assertion below
+	// would pass while proving nothing about deduplication.
+	if dupBody == "" || dupResultKey == "" {
+		t.Fatal("fixture failed to capture the first message's body/result key for the duplicate delivery")
+	}
+	if !slices.Contains(wantResultKeys, dupResultKey) {
+		t.Fatalf("duplicated body derives result key %q, which no seeded write expects: the replayed message "+
+			"must be a redelivery of an original one, or the version-count assertion below is vacuous", dupResultKey)
 	}
 	sort.Strings(wantResultKeys)
 
@@ -508,6 +594,28 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 			outBucket, gotKeys, wantResultKeys, stdout.String(), stderr.String())
 	}
 
+	// ── the redelivered message did not double-write ────────────────────
+	// The listing above cannot see this, and that is the whole reason this
+	// assertion exists. The duplicate carries the same bucket/key/versionId/ETag
+	// as the first message, so it derives the same output key AND — DefaultStub
+	// being a pure function of event metadata — the same bytes. Whether it was
+	// correctly skipped or wrongly reprocessed, the final listing and the
+	// object's content are identical. Only the number of writes differs.
+	//
+	// Object versions are that write count: one version means exactly one
+	// PutObject reached the key, so the second delivery was skipped before the
+	// put. Two versions would mean the worker really did process it again and
+	// overwrote its own result with identical bytes — the double write WR-023
+	// forbids, invisible to every other assertion in this file.
+	versions := itListVersionIDs(t, ctx, rawS3, outBucket, dupResultKey)
+	if len(versions) != 1 {
+		t.Errorf("output object %s/%s has %d versions (%q), want exactly 1: the redelivered message must be "+
+			"skipped, not reprocessed — >1 means the worker wrote the same result twice (identical bytes, so "+
+			"the object listing and content cannot reveal it); 0 means the original write never happened"+
+			"\nstdout:\n%s\nstderr:\n%s",
+			outBucket, dupResultKey, len(versions), versions, stdout.String(), stderr.String())
+	}
+
 	// ── SIGTERM ends the process cleanly ────────────────────────────────
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM to worker (pid %d): %v", cmd.Process.Pid, err)
@@ -555,45 +663,158 @@ func itListKeys(t *testing.T, ctx context.Context, client *s3.Client, bucket str
 	return keys
 }
 
+// itListVersionIDs returns the version ids S3 holds for exactly one object
+// key, sorted, paging through the listing so a truncated first page cannot
+// undercount. The listing is filtered on an exact key match rather than
+// trusting Prefix: a prefix search also returns keys that merely START with
+// it, which would overcount.
+//
+// Delete markers are deliberately excluded: nothing in this test deletes an
+// output object, so a marker would be a different bug from the double write
+// this is counting, and folding it into the count would blur the two.
+func itListVersionIDs(t *testing.T, ctx context.Context, client *s3.Client, bucket, key string) []string {
+	t.Helper()
+
+	var ids []string
+	var keyMarker, versionMarker *string
+	for {
+		out, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(bucket),
+			Prefix:          aws.String(key),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			t.Fatalf("ListObjectVersions(%s/%s): %v", bucket, key, err)
+		}
+		for _, v := range out.Versions {
+			if aws.ToString(v.Key) == key {
+				ids = append(ids, aws.ToString(v.VersionId))
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+		if aws.ToString(keyMarker) == "" && aws.ToString(versionMarker) == "" {
+			break
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// itAssertVersioningCountsWrites proves, before the worker is even started,
+// that this bucket really does record one version per PutObject — and that
+// itListVersionIDs really does see them.
+//
+// Without this probe the duplicate assertion would be mutation-fragile in the
+// worst way: if versioning silently were NOT in effect (a failed or ignored
+// PutBucketVersioning, a LocalStack that stubs it out), every key in the
+// bucket would report a single "null" version no matter how many times it was
+// written, and "want exactly 1 version" would pass unconditionally —
+// including for a worker that double-writes. The probe writes the same key
+// twice on purpose and requires the count to come back 2, so the signal is
+// known to have the resolution the later assertion depends on.
+//
+// It then removes both versions by id (a delete BY VERSION leaves no delete
+// marker behind, unlike an unqualified delete) and requires the bucket to be
+// empty again, so the probe cannot pollute the full-listing comparison the
+// test makes after the drain.
+func itAssertVersioningCountsWrites(t *testing.T, ctx context.Context, client *s3.Client, bucket string) {
+	t.Helper()
+
+	const probeKey = "weir-fixture-probe/versioning-check"
+	for i := 1; i <= 2; i++ {
+		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(probeKey),
+			Body:   bytes.NewReader([]byte("probe")),
+		}); err != nil {
+			t.Fatalf("fixture probe PutObject(%s/%s) #%d: %v", bucket, probeKey, i, err)
+		}
+	}
+
+	ids := itListVersionIDs(t, ctx, client, bucket, probeKey)
+	if len(ids) != 2 {
+		t.Fatalf("fixture probe: %s/%s reports %d versions (%q) after two PutObjects, want 2 — object "+
+			"versioning is not counting writes on this bucket, so the duplicate-delivery assertion later in "+
+			"this test would pass no matter what the worker did", bucket, probeKey, len(ids), ids)
+	}
+
+	for _, id := range ids {
+		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    aws.String(bucket),
+			Key:       aws.String(probeKey),
+			VersionId: aws.String(id),
+		}); err != nil {
+			t.Fatalf("fixture probe DeleteObject(%s/%s?versionId=%s): %v", bucket, probeKey, id, err)
+		}
+	}
+	if left := itListKeys(t, ctx, client, bucket); len(left) != 0 {
+		t.Fatalf("fixture probe left %q in bucket %q, want it empty: the probe must not pollute the "+
+			"post-drain object listing", left, bucket)
+	}
+}
+
 // itDeleteBucket empties then removes a bucket. S3 (LocalStack included)
 // refuses to delete a non-empty bucket, so the objects the worker wrote must
 // go first — otherwise every run would leave litter behind.
 //
-// It deliberately does NOT reuse itListKeys: that helper reports a listing
-// failure with t.Fatalf, whose runtime.Goexit would unwind this function
-// before DeleteBucket ever ran — leaking the very bucket this teardown exists
-// to remove. Here a listing failure is reported with t.Errorf and the loop
-// breaks, so the deletes below always get their chance. In teardown, a
-// best-effort continue beats an abort.
+// It lists OBJECT VERSIONS, not plain objects, and deletes each one by
+// version id, because the fixture turns versioning on. On a versioned bucket
+// an unqualified DeleteObject does not remove anything: it adds a delete
+// marker, the old versions and the marker all remain, the bucket is still
+// non-empty, and DeleteBucket fails — leaking a bucket on every run. Deleting
+// by version id (and removing delete markers, which are versions too) is the
+// only way to actually empty it. The same loop is correct on an unversioned
+// bucket, where each object reports the single version id "null".
+//
+// It deliberately does NOT reuse itListVersionIDs or itListKeys: those report
+// a listing failure with t.Fatalf, whose runtime.Goexit would unwind this
+// function before DeleteBucket ever ran — leaking the very bucket this
+// teardown exists to remove. Here a listing failure is reported with t.Errorf
+// and the loop breaks, so the deletes below always get their chance. In
+// teardown, a best-effort continue beats an abort.
 func itDeleteBucket(t *testing.T, ctx context.Context, client *s3.Client, bucket string) {
 	t.Helper()
 
-	var keys []string
-	var token *string
+	type objectVersion struct{ key, versionID string }
+
+	var versions []objectVersion
+	var keyMarker, versionMarker *string
 	for {
-		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(bucket),
-			ContinuationToken: token,
+		out, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(bucket),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
 		})
 		if err != nil {
-			t.Errorf("teardown ListObjectsV2(%q): %v", bucket, err)
+			t.Errorf("teardown ListObjectVersions(%q): %v", bucket, err)
 			break
 		}
-		for _, obj := range out.Contents {
-			keys = append(keys, aws.ToString(obj.Key))
+		for _, v := range out.Versions {
+			versions = append(versions, objectVersion{aws.ToString(v.Key), aws.ToString(v.VersionId)})
 		}
-		if !aws.ToBool(out.IsTruncated) || aws.ToString(out.NextContinuationToken) == "" {
+		for _, m := range out.DeleteMarkers {
+			versions = append(versions, objectVersion{aws.ToString(m.Key), aws.ToString(m.VersionId)})
+		}
+		if !aws.ToBool(out.IsTruncated) {
 			break
 		}
-		token = out.NextContinuationToken
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+		if aws.ToString(keyMarker) == "" && aws.ToString(versionMarker) == "" {
+			break
+		}
 	}
 
-	for _, key := range keys {
-		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-		}); err != nil {
-			t.Errorf("teardown DeleteObject(%s/%s): %v", bucket, key, err)
+	for _, v := range versions {
+		in := &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(v.key)}
+		if v.versionID != "" {
+			in.VersionId = aws.String(v.versionID)
+		}
+		if _, err := client.DeleteObject(ctx, in); err != nil {
+			t.Errorf("teardown DeleteObject(%s/%s?versionId=%s): %v", bucket, v.key, v.versionID, err)
 		}
 	}
 	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
