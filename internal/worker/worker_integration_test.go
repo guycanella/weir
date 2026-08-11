@@ -21,11 +21,13 @@ package worker_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,10 +37,14 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
 	"github.com/guycanella/weir/internal/awsclient"
 	"github.com/guycanella/weir/internal/awsclient/awssdk"
+	"github.com/guycanella/weir/internal/events"
+	"github.com/guycanella/weir/internal/processing"
 )
 
 const (
@@ -75,6 +81,17 @@ const (
 	// itCleanupTimeout bounds teardown. Cleanups cannot use t.Context():
 	// it is canceled before t.Cleanup runs.
 	itCleanupTimeout = 30 * time.Second
+
+	// itInputBucket is the bucket name embedded in the fake S3 event
+	// notifications the fixture seeds. It is never created: the worker only
+	// ever reads the name out of the event body (WR-023's stub derives its
+	// result from event METADATA, never from the object's content), so an
+	// existing bucket would add nothing but teardown litter.
+	itInputBucket = "weir-wr021-uploads"
+
+	// itEventTime is the fixed eventTime stamped into every seeded record,
+	// keeping the fixture free of wall-clock dependence.
+	itEventTime = "2026-07-24T12:00:00.000Z"
 )
 
 // itLocalStackEnv returns the endpoint and region to test against, skipping
@@ -127,6 +144,86 @@ func itRawSQSClient(t *testing.T, ctx context.Context) *sqs.Client {
 	return sqs.NewFromConfig(cfg, func(o *sqs.Options) { o.BaseEndpoint = aws.String(endpoint) })
 }
 
+// itRawS3Client builds an S3 client directly, for the same reason
+// itRawSQSClient exists: the fixture needs bucket lifecycle operations
+// (CreateBucket / ListObjectsV2 / DeleteObject / DeleteBucket) that
+// awsclient.S3Client deliberately does not expose. Path-style addressing is
+// required against LocalStack, whose single endpoint cannot serve
+// virtual-host bucket names.
+func itRawS3Client(t *testing.T, ctx context.Context) *s3.Client {
+	t.Helper()
+
+	endpoint, region := itLocalStackEnv(t)
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		t.Fatalf("load AWS config for raw S3 fixture client: %v", err)
+	}
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = true
+	})
+}
+
+// itSNSBody builds the exact wire format a message arrives in off SQS under
+// ADR-001 (S3 -> SNS -> SQS): an S3 event notification JSON, encoded as a
+// *string* inside an SNS "Notification" envelope. The double encoding is
+// reproduced faithfully — via json.Marshal of the inner payload, then of the
+// envelope carrying it as a field — because the worker now runs the real
+// events.ParseS3Events over this body, and a shortcut that skipped the
+// double-encode would be rejected as malformed.
+func itSNSBody(t *testing.T, region, bucket, key string, size int64, etag string) string {
+	t.Helper()
+
+	inner, err := json.Marshal(map[string]any{
+		"Records": []any{
+			map[string]any{
+				"eventVersion": "2.1",
+				"eventSource":  "aws:s3",
+				"awsRegion":    region,
+				"eventTime":    itEventTime,
+				"eventName":    "ObjectCreated:Put",
+				"s3": map[string]any{
+					"bucket": map[string]any{"name": bucket},
+					"object": map[string]any{
+						"key":  key,
+						"size": size,
+						"eTag": etag,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal inner S3 notification for %s/%s: %v", bucket, key, err)
+	}
+
+	envelope, err := json.Marshal(map[string]any{
+		"Type":      "Notification",
+		"MessageId": fmt.Sprintf("22b81b1a-0000-0000-0000-%012d", rand.IntN(1_000_000_000)),
+		"TopicArn":  "arn:aws:sns:" + region + ":000000000000:" + bucket,
+		"Message":   string(inner),
+		"Timestamp": itEventTime,
+	})
+	if err != nil {
+		t.Fatalf("marshal SNS envelope for %s/%s: %v", bucket, key, err)
+	}
+
+	// Guard the fixture against itself: if this body did not parse to exactly
+	// one event, the drain assertion below would still pass (the worker treats
+	// an SNS handshake or an empty-Records notification as a no-op success and
+	// deletes the message), and the test would be silently vacuous.
+	got, err := events.ParseS3Events([]byte(envelope))
+	if err != nil {
+		t.Fatalf("fixture body for %s/%s does not parse as an S3 event notification: %v\nbody: %s", bucket, key, err, envelope)
+	}
+	if len(got) != 1 || got[0].Key != key {
+		t.Fatalf("fixture body for %s/%s parsed to %+v, want exactly one event with that key", bucket, key, got)
+	}
+
+	return string(envelope)
+}
+
 // itUniqueName builds a collision-resistant queue name, so repeat and
 // concurrent runs never contend and a leaked queue from an earlier run
 // cannot make a later one pass.
@@ -142,6 +239,7 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	endpoint, region := itLocalStackEnv(t)
 	clients := itClients(t, ctx)
 	rawSQS := itRawSQSClient(t, ctx)
+	rawS3 := itRawS3Client(t, ctx)
 
 	// ── fixture queue ───────────────────────────────────────────────────
 	name := itUniqueName("weir-wr021")
@@ -169,14 +267,50 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 		}
 	})
 
+	// ── fixture output bucket ───────────────────────────────────────────
+	// WR-023 made OUTPUT_BUCKET required configuration and the worker now
+	// writes one result object per event, so the bucket has to really exist:
+	// a PutObject into a missing bucket fails, the message is never deleted,
+	// and the drain below would time out.
+	outBucket := itUniqueName("weir-wr021-out")
+	createBucket := &s3.CreateBucketInput{Bucket: aws.String(outBucket)}
+	// Outside us-east-1, S3 rejects a CreateBucket with no LocationConstraint
+	// ("the unspecified location constraint is incompatible for the region
+	// specific endpoint this request was sent to"), and LocalStack faithfully
+	// reproduces that — the Makefile runs this suite against us-east-2.
+	// us-east-1 is the opposite: it rejects the constraint being stated.
+	if region != "us-east-1" {
+		createBucket.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(region),
+		}
+	}
+	if _, err := rawS3.CreateBucket(ctx, createBucket); err != nil {
+		t.Fatalf("fixture CreateBucket(%q) in region %q: %v", outBucket, region, err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), itCleanupTimeout)
+		defer cancel()
+		itDeleteBucket(t, cleanupCtx, rawS3, outBucket)
+	})
+
+	// ── seed the queue ──────────────────────────────────────────────────
+	// Bodies are real SNS-wrapped S3 event notifications, one distinct
+	// object key each: since WR-023 the worker parses the body for real, so
+	// plain text would be a genuine unmarshal error, leave every message
+	// undeleted, and fail the drain.
+	wantResultKeys := make([]string, 0, itMessageCount)
 	for i := 1; i <= itMessageCount; i++ {
+		key := fmt.Sprintf("wr-021-integration/message-%d.txt", i)
+		body := itSNSBody(t, region, itInputBucket, key, int64(i*100), fmt.Sprintf("%032x", i))
 		if _, err := clients.SQS.SendMessage(ctx, awsclient.SendMessageInput{
 			QueueUrl: queueURL,
-			Body:     fmt.Sprintf("wr-021 integration message %d", i),
+			Body:     body,
 		}); err != nil {
 			t.Fatalf("fixture SendMessage(%d): %v", i, err)
 		}
+		wantResultKeys = append(wantResultKeys, processing.OutputKey(events.Event{Bucket: itInputBucket, Key: key}))
 	}
+	sort.Strings(wantResultKeys)
 
 	// ── build and start the worker binary ───────────────────────────────
 	bin := buildWorkerBinary(t)
@@ -190,6 +324,7 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	cmd := exec.Command(bin)
 	cmd.Env = []string{
 		"QUEUE_URL=" + queueURL,
+		"OUTPUT_BUCKET=" + outBucket,
 		itEnvRegion + "=" + region,
 		itEnvEndpointURL + "=" + endpoint,
 		// LocalStack's dummy credentials, supplied explicitly so the
@@ -260,6 +395,17 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 			queueURL, itDrainDeadline, lastVisible, lastInFlight, stdout.String(), stderr.String())
 	}
 
+	// ── the messages were really processed, not just deleted ────────────
+	// A deleted message alone does not prove work happened: the worker also
+	// deletes bodies it recognizes as no-ops. One result object per seeded
+	// key is what distinguishes "drained because processed" from "drained
+	// because ignored". The puts precede the deletes, so by the time the
+	// queue reads zero these objects must already be listable.
+	if gotKeys := itListKeys(t, ctx, rawS3, outBucket); !itEqualStrings(gotKeys, wantResultKeys) {
+		t.Errorf("objects in output bucket %q = %q, want %q\nstdout:\n%s\nstderr:\n%s",
+			outBucket, gotKeys, wantResultKeys, stdout.String(), stderr.String())
+	}
+
 	// ── SIGTERM ends the process cleanly ────────────────────────────────
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM to worker (pid %d): %v", cmd.Process.Pid, err)
@@ -278,6 +424,65 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 		t.Fatalf("worker did not exit within %s of SIGTERM — graceful shutdown is stuck\nstdout:\n%s\nstderr:\n%s",
 			itExitDeadline, stdout.String(), stderr.String())
 	}
+}
+
+// itListKeys returns every object key in bucket, sorted, paging through the
+// listing so the assertion cannot be fooled by a truncated first page.
+func itListKeys(t *testing.T, ctx context.Context, client *s3.Client, bucket string) []string {
+	t.Helper()
+
+	var keys []string
+	var token *string
+	for {
+		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			t.Fatalf("ListObjectsV2(%q): %v", bucket, err)
+		}
+		for _, obj := range out.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+		if !aws.ToBool(out.IsTruncated) || aws.ToString(out.NextContinuationToken) == "" {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// itDeleteBucket empties then removes a bucket. S3 (LocalStack included)
+// refuses to delete a non-empty bucket, so the objects the worker wrote must
+// go first — otherwise every run would leave litter behind.
+func itDeleteBucket(t *testing.T, ctx context.Context, client *s3.Client, bucket string) {
+	t.Helper()
+
+	for _, key := range itListKeys(t, ctx, client, bucket) {
+		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		}); err != nil {
+			t.Errorf("teardown DeleteObject(%s/%s): %v", bucket, key, err)
+		}
+	}
+	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Errorf("teardown DeleteBucket(%q): %v — LocalStack may be left with a leftover test bucket", bucket, err)
+	}
+}
+
+// itEqualStrings compares two sorted key slices.
+func itEqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildWorkerBinary compiles ./cmd/worker into the test's temp dir and

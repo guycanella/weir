@@ -14,7 +14,7 @@ import (
 //
 // Design decisions this suite pins down for the implementer (Julia):
 //
-//   - Signature: idempotencyKey(bucket, key, versionID, etag string) string.
+//   - Signature: Key(bucket, key, versionID, etag string) string.
 //     It takes exactly the four IDENTITY fields, not the whole events.Event.
 //     That is deliberate: EventName, EventTime and Size are NOT identity. The
 //     same object write can be re-delivered with a different EventTime (SQS
@@ -55,7 +55,7 @@ import (
 //     unambiguously makes the PREIMAGE ENCODING injective, so two distinct
 //     tuples cannot collide by having content straddle an ambiguous field
 //     boundary. That class of collision is eliminated structurally, and the
-//     tests below exercise it exhaustively. It does not make idempotencyKey
+//     tests below exercise it exhaustively. It does not make Key
 //     itself injective — SHA-256 maps an unbounded input space onto 256 bits,
 //     so distinct tuples can in theory share a digest. What the function
 //     offers overall is collision RESISTANCE, not collision freedom; what the
@@ -64,7 +64,7 @@ import (
 //     tests can prove.
 
 // identity is one (bucket, key, versionID, etag) tuple: the full input to
-// idempotencyKey.
+// Key.
 type identity struct {
 	name      string
 	bucket    string
@@ -74,7 +74,7 @@ type identity struct {
 }
 
 func (id identity) call() string {
-	return idempotencyKey(id.bucket, id.key, id.versionID, id.etag)
+	return Key(id.bucket, id.key, id.versionID, id.etag)
 }
 
 func (id identity) tuple() [4]string {
@@ -263,12 +263,12 @@ func TestIdempotencyKeyIsDeterministic(t *testing.T) {
 		t.Run(id.name, func(t *testing.T) {
 			first := id.call()
 			if first == "" {
-				t.Fatalf("idempotencyKey(%q, %q, %q, %q) = empty string, want a key",
+				t.Fatalf("Key(%q, %q, %q, %q) = empty string, want a key",
 					id.bucket, id.key, id.versionID, id.etag)
 			}
 			for i := 0; i < 100; i++ {
 				if got := id.call(); got != first {
-					t.Fatalf("call #%d: idempotencyKey(%q, %q, %q, %q) = %q, want %q (not deterministic)",
+					t.Fatalf("call #%d: Key(%q, %q, %q, %q) = %q, want %q (not deterministic)",
 						i+2, id.bucket, id.key, id.versionID, id.etag, got, first)
 				}
 			}
@@ -288,7 +288,7 @@ func TestIdempotencyKeyFormat(t *testing.T) {
 		t.Run(id.name, func(t *testing.T) {
 			got := id.call()
 			if !format.MatchString(got) {
-				t.Errorf("idempotencyKey(%q, %q, %q, %q) = %q, want 64 lowercase hex chars matching %s",
+				t.Errorf("Key(%q, %q, %q, %q) = %q, want 64 lowercase hex chars matching %s",
 					id.bucket, id.key, id.versionID, id.etag, got, format)
 			}
 		})
@@ -384,7 +384,7 @@ func TestIdempotencyKeyGoldenVectors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.call(); got != tc.want {
-				t.Errorf("idempotencyKey(%q, %q, %q, %q) = %q, want %q\n"+
+				t.Errorf("Key(%q, %q, %q, %q) = %q, want %q\n"+
 					"the key framing changed. If this was intentional, note that keys are persisted "+
 					"from WR-010 on: every previously processed event will hash differently and be "+
 					"reprocessed, so the change needs a versioned migration of the seen-events store, "+
@@ -562,15 +562,15 @@ func TestIdempotencyKeyUnversionedObjectIsStableAndDistinct(t *testing.T) {
 		etag   = "d41d8cd98f00b204e9800998ecf8427e"
 	)
 
-	unversioned := idempotencyKey(bucket, key, "", etag)
+	unversioned := Key(bucket, key, "", etag)
 	if unversioned == "" {
-		t.Fatal("idempotencyKey with an empty versionID returned an empty key, want a valid key")
+		t.Fatal("Key with an empty versionID returned an empty key, want a valid key")
 	}
-	if again := idempotencyKey(bucket, key, "", etag); again != unversioned {
+	if again := Key(bucket, key, "", etag); again != unversioned {
 		t.Errorf("empty versionID is not deterministic: got %q then %q", unversioned, again)
 	}
 
-	versioned := idempotencyKey(bucket, key, "PHtexPGjH2y.zBgT8LmB7wwLI2mpbz.k", etag)
+	versioned := Key(bucket, key, "PHtexPGjH2y.zBgT8LmB7wwLI2mpbz.k", etag)
 	if versioned == unversioned {
 		t.Errorf("empty and non-empty versionID produced the same key %q for the same bucket/key/etag",
 			unversioned)

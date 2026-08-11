@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 )
 
-// idempotencyKey derives a deterministic, collision-resistant key from the
+// Key derives a deterministic, collision-resistant key from the
 // identity of an S3 object write: its bucket, key, version ID and ETag.
 //
 // The function is total and pure: it never errors or panics, performs no
@@ -25,7 +25,7 @@ import (
 // field boundaries or content "straddling" a boundary. This eliminates that
 // specific class of collision; SHA-256 itself remains collision-resistant,
 // not collision-proof, over its full (unbounded) input space.
-func idempotencyKey(bucket, key, versionID, etag string) string {
+func Key(bucket, key, versionID, etag string) string {
 	h := sha256.New()
 
 	for _, field := range []string{bucket, key, versionID, etag} {

@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/guycanella/weir/internal/awsclient"
 	"github.com/guycanella/weir/internal/awsclient/awssdk"
+	"github.com/guycanella/weir/internal/processing"
 	"github.com/guycanella/weir/internal/worker"
 )
 
@@ -60,10 +60,15 @@ func main() {
 	queueURL := strings.TrimSpace(os.Getenv("QUEUE_URL"))
 	region := strings.TrimSpace(os.Getenv("AWS_REGION"))
 	endpointURL := strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL"))
+	outputBucket := strings.TrimSpace(os.Getenv("OUTPUT_BUCKET"))
 	concurrency := parseConcurrency(os.Getenv("WORKER_CONCURRENCY"))
 
-	if queueURL == "" || region == "" {
-		logger.Error("missing required configuration", "QUEUE_URL_set", queueURL != "", "AWS_REGION_set", region != "")
+	if queueURL == "" || region == "" || outputBucket == "" {
+		logger.Error("missing required configuration",
+			"QUEUE_URL_set", queueURL != "",
+			"AWS_REGION_set", region != "",
+			"OUTPUT_BUCKET_set", outputBucket != "",
+		)
 		os.Exit(1)
 	}
 
@@ -76,15 +81,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	process, err := processing.New(processing.Config{
+		S3Client:     clients.S3,
+		OutputBucket: outputBucket,
+		Store:        processing.NewInMemoryStore(),
+	})
+	if err != nil {
+		logger.Error("build processing pipeline", "error", err)
+		os.Exit(1)
+	}
+
 	w := worker.New(worker.Worker{
 		SQSClient:     clients.SQS,
 		QueueURL:      queueURL,
 		ShutdownGrace: shutdownGrace,
 		Concurrency:   concurrency,
-		Process: func(_ context.Context, msg awsclient.Message) error {
-			logger.Info("processing message", "message_id", msg.MessageId)
-			return nil
-		},
+		Process:       process,
 	})
 
 	if err := w.Run(ctx); err != nil {

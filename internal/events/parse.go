@@ -74,11 +74,11 @@ type s3EventPayload struct {
 // created. It carries no Records key at all.
 const s3TestEvent = "s3:TestEvent"
 
-// parseS3Events parses raw bytes off the queue into domain events. The wire
+// ParseS3Events parses raw bytes off the queue into domain events. The wire
 // format is always SNS-wrapped (S3 -> SNS -> SQS, ADR-001): the SNS envelope
 // check happens before touching the inner payload so a bare S3 event or an
 // SNS handshake never gets misread as a parse failure.
-func parseS3Events(raw []byte) ([]Event, error) {
+func ParseS3Events(raw []byte) ([]Event, error) {
 	var env snsEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("events: unmarshal SNS envelope: %w", err)
