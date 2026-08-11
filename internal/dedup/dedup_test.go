@@ -89,7 +89,7 @@ import (
 // --- keys used across the suite -------------------------------------------
 //
 // Real inputs are 64-char lowercase-hex SHA-256 digests from
-// idempotency.idempotencyKey. keyB differs from keyA only in its final
+// idempotency.Key. keyB differs from keyA only in its final
 // character, which is the realistic near-miss: two different object writes
 // whose digests share a long prefix must never be conflated.
 const (
@@ -510,7 +510,7 @@ func TestIsDuplicateAfterStoreRecoversTheKeyIsStillNew(t *testing.T) {
 // An empty key is OUT OF CONTRACT and is rejected with ErrEmptyKey, without the
 // store being touched. Why reject rather than treat "" as just another string:
 //
-//   - It cannot arise legitimately. idempotency.idempotencyKey is total and
+//   - It cannot arise legitimately. idempotency.Key is total and
 //     always returns 64 hex characters, for every input including all-empty
 //     fields. So "" can only mean a caller bug — an unset variable, a field
 //     read from the wrong struct, a key that was never computed.

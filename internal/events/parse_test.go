@@ -17,7 +17,7 @@ import (
 //
 // Design decisions this suite pins down for the implementer (Julia):
 //
-//   - parseS3Events(raw []byte) ([]Event, error) parses the SNS envelope, then
+//   - ParseS3Events(raw []byte) ([]Event, error) parses the SNS envelope, then
 //     the inner (double-encoded) S3 payload, and returns ONE domain Event per
 //     element of the inner Records array (S3 batches multiple records into one
 //     notification). Order is preserved.
@@ -213,12 +213,12 @@ func TestParseS3Events_Success(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseS3Events(tc.raw)
+			got, err := ParseS3Events(tc.raw)
 			if err != nil {
-				t.Fatalf("parseS3Events returned unexpected error: %v", err)
+				t.Fatalf("ParseS3Events returned unexpected error: %v", err)
 			}
 			if len(got) != len(tc.want) {
-				t.Fatalf("parseS3Events returned %d events, want %d: %+v", len(got), len(tc.want), got)
+				t.Fatalf("ParseS3Events returned %d events, want %d: %+v", len(got), len(tc.want), got)
 			}
 			for i := range tc.want {
 				assertEventEqual(t, i, got[i], tc.want[i])
@@ -261,12 +261,12 @@ func TestParseS3Events_SubscriptionConfirmation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseS3Events(tc.raw)
+			got, err := ParseS3Events(tc.raw)
 			if !errors.Is(err, ErrNotNotification) {
-				t.Fatalf("parseS3Events error = %v, want errors.Is(..., ErrNotNotification)", err)
+				t.Fatalf("ParseS3Events error = %v, want errors.Is(..., ErrNotNotification)", err)
 			}
 			if len(got) != 0 {
-				t.Errorf("parseS3Events returned %d events, want 0 on a non-notification", len(got))
+				t.Errorf("ParseS3Events returned %d events, want 0 on a non-notification", len(got))
 			}
 		})
 	}
@@ -379,12 +379,12 @@ func TestParseS3Events_Malformed(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseS3Events(tc.raw)
+			_, err := ParseS3Events(tc.raw)
 			if err == nil {
-				t.Fatalf("parseS3Events(%s) = nil error, want a parse error", tc.name)
+				t.Fatalf("ParseS3Events(%s) = nil error, want a parse error", tc.name)
 			}
 			if errors.Is(err, ErrNotNotification) {
-				t.Fatalf("parseS3Events(%s) returned the skip sentinel; malformed input must be a distinct error", tc.name)
+				t.Fatalf("ParseS3Events(%s) returned the skip sentinel; malformed input must be a distinct error", tc.name)
 			}
 		})
 	}
