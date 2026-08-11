@@ -18,11 +18,17 @@ import (
 // --- OutputKey -------------------------------------------------------------
 
 // TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix pins the derivation:
-// the result object keeps the source object's full path and gains
-// ResultSuffix.
+// the result object is namespaced under the SOURCE BUCKET, keeps the source
+// object's full path, and gains ResultSuffix — i.e.
+// "<bucket>/<key>" + ResultSuffix.
 //
 // Why this convention, over the alternatives:
 //
+//   - Namespacing by source bucket is what makes the derivation injective over
+//     (bucket, key). Deriving from the key alone would let two DIFFERENT source
+//     buckets that happen to hold the same object key silently overwrite each
+//     other's results in one shared output bucket — a data-integrity bug, not a
+//     cosmetic one, and invisible from the output bucket afterwards.
 //   - Mirroring the path makes provenance obvious to a human browsing the
 //     output bucket, and makes two different source objects structurally
 //     incapable of colliding on one result object.
@@ -32,7 +38,7 @@ import (
 //     It is NOT a defense against the notification loop that misconfiguration
 //     would cause — preventing that belongs to the infra layer's prefix/
 //     suffix filters — just a cheap way to avoid destroying the input.
-//   - It is a pure function of the key alone, so it is stable across
+//   - It is a pure function of (Bucket, Key) alone, so it is stable across
 //     redeliveries: the second delivery of an event derives the same output
 //     key, which is what makes the write idempotent even in the window where
 //     the dedup store has not yet answered.
@@ -45,42 +51,42 @@ func TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix(t *testing.T) {
 		{
 			name: "nested key keeps its full path",
 			key:  "raw/video1.mp4",
-			want: "raw/video1.mp4" + ResultSuffix,
+			want: inputBucket + "/raw/video1.mp4" + ResultSuffix,
 		},
 		{
 			name: "top-level key",
 			key:  "video1.mp4",
-			want: "video1.mp4" + ResultSuffix,
+			want: inputBucket + "/video1.mp4" + ResultSuffix,
 		},
 		{
 			name: "deeply nested key",
 			key:  "raw/2026/07/24/video1.mp4",
-			want: "raw/2026/07/24/video1.mp4" + ResultSuffix,
+			want: inputBucket + "/raw/2026/07/24/video1.mp4" + ResultSuffix,
 		},
 		{
 			name: "key with spaces (already URL-decoded by the parser) is used literally",
 			key:  "raw/my file name.mp4",
-			want: "raw/my file name.mp4" + ResultSuffix,
+			want: inputBucket + "/raw/my file name.mp4" + ResultSuffix,
 		},
 		{
 			name: "key with no extension",
 			key:  "raw/video1",
-			want: "raw/video1" + ResultSuffix,
+			want: inputBucket + "/raw/video1" + ResultSuffix,
 		},
 		{
 			name: "non-ASCII key is preserved byte for byte",
 			key:  "raw/vídeo–1.mp4",
-			want: "raw/vídeo–1.mp4" + ResultSuffix,
+			want: inputBucket + "/raw/vídeo–1.mp4" + ResultSuffix,
 		},
 		{
 			name: "the suffix is appended unconditionally, even to a key that already ends in it",
 			key:  "raw/video1.mp4" + ResultSuffix,
-			want: "raw/video1.mp4" + ResultSuffix + ResultSuffix,
+			want: inputBucket + "/raw/video1.mp4" + ResultSuffix + ResultSuffix,
 		},
 		{
 			name: "empty key (out of contract for the parser, but the function stays total)",
 			key:  "",
-			want: ResultSuffix,
+			want: inputBucket + "/" + ResultSuffix,
 		},
 	}
 
@@ -88,40 +94,72 @@ func TestOutputKeyMirrorsTheSourceKeyWithTheResultSuffix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := OutputKey(events.Event{Bucket: inputBucket, Key: tc.key})
 			if got != tc.want {
-				t.Errorf("OutputKey(key=%q) = %q, want %q", tc.key, got, tc.want)
+				t.Errorf("OutputKey(bucket=%q, key=%q) = %q, want %q", inputBucket, tc.key, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestOutputKeyDependsOnlyOnTheObjectKey pins that the derivation ignores
-// every other field. This is what makes a redelivery — which may legitimately
-// carry a different EventTime — resolve to the same output object, so even a
-// double write is an overwrite rather than a duplicate result.
-func TestOutputKeyDependsOnlyOnTheObjectKey(t *testing.T) {
-	a := events.Event{
-		Bucket:    "bucket-a",
-		Key:       "raw/video1.mp4",
-		Size:      1,
-		ETag:      "etag-a",
-		VersionID: "v1",
-		EventName: "ObjectCreated:Put",
-		EventTime: mustTime(t, eventTimeStr),
-	}
-	b := events.Event{
-		Bucket:    "bucket-b",
-		Key:       "raw/video1.mp4",
-		Size:      999,
-		ETag:      "etag-b",
-		VersionID: "v2",
-		EventName: "ObjectCreated:CompleteMultipartUpload",
-		EventTime: mustTime(t, eventTimeStr).Add(time.Hour),
-	}
+// TestOutputKeyDependsOnBucketAndKeyOnly pins both halves of the derivation's
+// contract, which pull in opposite directions and are therefore easy to get
+// half-right:
+//
+//   - It DEPENDS on Bucket as well as Key. Two events carrying the same object
+//     key from different source buckets are different objects and must resolve
+//     to different result objects; collapsing them would mean one silently
+//     overwriting the other's result in a shared output bucket.
+//   - It IGNORES every other field. A redelivery may legitimately carry a
+//     different EventTime (and a re-upload a different Size/ETag/VersionID),
+//     and all of those must still resolve to the same output object, so even a
+//     double write is an overwrite rather than a duplicate result.
+func TestOutputKeyDependsOnBucketAndKeyOnly(t *testing.T) {
+	t.Run("a different source bucket yields a different output key", func(t *testing.T) {
+		const sharedKey = "raw/video1.mp4"
 
-	if got, want := OutputKey(b), OutputKey(a); got != want {
-		t.Errorf("OutputKey differs (%q vs %q) for two events sharing an object key; the derivation must "+
-			"depend on Key alone, so redeliveries and re-writes land on the same output object", got, want)
-	}
+		a := OutputKey(events.Event{Bucket: "bucket-a", Key: sharedKey})
+		b := OutputKey(events.Event{Bucket: "bucket-b", Key: sharedKey})
+
+		if a == b {
+			t.Errorf("OutputKey collapsed two source buckets onto one output key (%q) for the shared object "+
+				"key %q; the derivation must namespace by Bucket, or one bucket's result silently overwrites "+
+				"the other's in a shared output bucket", a, sharedKey)
+		}
+	})
+
+	t.Run("every field besides bucket and key is ignored", func(t *testing.T) {
+		a := events.Event{
+			Bucket:    inputBucket,
+			Key:       "raw/video1.mp4",
+			Size:      1,
+			ETag:      "etag-a",
+			VersionID: "v1",
+			EventName: "ObjectCreated:Put",
+			EventTime: mustTime(t, eventTimeStr),
+		}
+		b := events.Event{
+			Bucket:    inputBucket,
+			Key:       "raw/video1.mp4",
+			Size:      999,
+			ETag:      "etag-b",
+			VersionID: "v2",
+			EventName: "ObjectCreated:CompleteMultipartUpload",
+			EventTime: mustTime(t, eventTimeStr).Add(time.Hour),
+		}
+
+		if got, want := OutputKey(b), OutputKey(a); got != want {
+			t.Errorf("OutputKey differs (%q vs %q) for two events sharing a bucket and object key; the "+
+				"derivation must depend on Bucket and Key alone, so redeliveries and re-writes land on the "+
+				"same output object", got, want)
+		}
+	})
+
+	t.Run("a zero-value event is still total", func(t *testing.T) {
+		// Out of contract for the parser, but the function must not panic or
+		// depend on either field being non-empty.
+		if got, want := OutputKey(events.Event{}), "/"+ResultSuffix; got != want {
+			t.Errorf("OutputKey(zero value) = %q, want %q — the derivation must stay total", got, want)
+		}
+	})
 }
 
 // TestOutputKeyIsDeterministic states the property directly: repeated calls
@@ -139,6 +177,9 @@ func TestOutputKeyIsDeterministic(t *testing.T) {
 	}
 	if !strings.HasSuffix(first, ResultSuffix) {
 		t.Errorf("OutputKey = %q, want it to end in ResultSuffix (%q)", first, ResultSuffix)
+	}
+	if !strings.HasPrefix(first, inputBucket+"/") {
+		t.Errorf("OutputKey = %q, want it namespaced under the source bucket (prefix %q)", first, inputBucket+"/")
 	}
 	if first == "" {
 		t.Error("OutputKey returned an empty key")

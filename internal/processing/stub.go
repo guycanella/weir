@@ -15,13 +15,15 @@ const DefaultContentType = "application/json"
 // object key (see OutputKey).
 const ResultSuffix = ".result.json"
 
-// OutputKey derives the output-bucket key for evt's result, from evt.Key
-// alone. It is a pure, total, deterministic function: see
-// stub_test.go for the exact contract (nested paths, non-ASCII, an
-// already-suffixed key, the empty key) and helpers_test.go/process_test.go
-// for why the derivation intentionally ignores every other field.
+// OutputKey derives the output-bucket key for evt's result, namespaced by
+// evt.Bucket so that two events with the same object key but different
+// source buckets never collide in a shared output bucket. It is a pure,
+// total, deterministic function: see stub_test.go for the exact contract
+// (nested paths, non-ASCII, an already-suffixed key, the empty key) and
+// helpers_test.go/process_test.go for why the derivation ignores every
+// other field besides evt.Bucket and evt.Key.
 func OutputKey(evt events.Event) string {
-	return evt.Key + ResultSuffix
+	return evt.Bucket + "/" + evt.Key + ResultSuffix
 }
 
 // defaultStubResult is the JSON shape DefaultStub produces. It is a plain

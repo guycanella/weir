@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -401,7 +402,7 @@ func TestWorkerBinaryDrainsQueueAndExitsOnSIGTERM(t *testing.T) {
 	// key is what distinguishes "drained because processed" from "drained
 	// because ignored". The puts precede the deletes, so by the time the
 	// queue reads zero these objects must already be listable.
-	if gotKeys := itListKeys(t, ctx, rawS3, outBucket); !itEqualStrings(gotKeys, wantResultKeys) {
+	if gotKeys := itListKeys(t, ctx, rawS3, outBucket); !slices.Equal(gotKeys, wantResultKeys) {
 		t.Errorf("objects in output bucket %q = %q, want %q\nstdout:\n%s\nstderr:\n%s",
 			outBucket, gotKeys, wantResultKeys, stdout.String(), stderr.String())
 	}
@@ -456,10 +457,37 @@ func itListKeys(t *testing.T, ctx context.Context, client *s3.Client, bucket str
 // itDeleteBucket empties then removes a bucket. S3 (LocalStack included)
 // refuses to delete a non-empty bucket, so the objects the worker wrote must
 // go first — otherwise every run would leave litter behind.
+//
+// It deliberately does NOT reuse itListKeys: that helper reports a listing
+// failure with t.Fatalf, whose runtime.Goexit would unwind this function
+// before DeleteBucket ever ran — leaking the very bucket this teardown exists
+// to remove. Here a listing failure is reported with t.Errorf and the loop
+// breaks, so the deletes below always get their chance. In teardown, a
+// best-effort continue beats an abort.
 func itDeleteBucket(t *testing.T, ctx context.Context, client *s3.Client, bucket string) {
 	t.Helper()
 
-	for _, key := range itListKeys(t, ctx, client, bucket) {
+	var keys []string
+	var token *string
+	for {
+		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			t.Errorf("teardown ListObjectsV2(%q): %v", bucket, err)
+			break
+		}
+		for _, obj := range out.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+		if !aws.ToBool(out.IsTruncated) || aws.ToString(out.NextContinuationToken) == "" {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	for _, key := range keys {
 		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
@@ -470,19 +498,6 @@ func itDeleteBucket(t *testing.T, ctx context.Context, client *s3.Client, bucket
 	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Errorf("teardown DeleteBucket(%q): %v — LocalStack may be left with a leftover test bucket", bucket, err)
 	}
-}
-
-// itEqualStrings compares two sorted key slices.
-func itEqualStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // buildWorkerBinary compiles ./cmd/worker into the test's temp dir and

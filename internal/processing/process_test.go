@@ -730,8 +730,9 @@ func TestCallerContextReachesTheStoreAndS3(t *testing.T) {
 // --- output key collision semantics ---------------------------------------
 
 // TestTwoVersionsOfTheSameObjectShareOneOutputKey documents an accepted
-// consequence of the chosen output-key derivation (mirror the source key,
-// append ResultSuffix): the derivation deliberately ignores VersionID, while
+// consequence of the chosen output-key derivation (namespace by the source
+// bucket, mirror the source key, append ResultSuffix): the derivation
+// deliberately ignores VersionID, while
 // the idempotency key does not. So two writes to the same object key on a
 // versioned bucket are two distinct events — both fresh, both processed —
 // whose results land on the same output object, the later overwriting the
@@ -762,7 +763,7 @@ func TestTwoVersionsOfTheSameObjectShareOneOutputKey(t *testing.T) {
 	}
 	wantKey := OutputKey(putEvent(t, v1))
 	if got := h.s3.storedKeys(outputBucket); len(got) != 1 || got[0] != wantKey {
-		t.Errorf("output bucket holds %q, want exactly [%q]: the output key mirrors the source key and "+
+		t.Errorf("output bucket holds %q, want exactly [%q]: the output key mirrors the source bucket+key and "+
 			"ignores VersionID, so the newer result overwrites the older", got, wantKey)
 	}
 }

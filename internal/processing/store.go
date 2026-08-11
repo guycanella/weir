@@ -19,6 +19,11 @@ import (
 //   - Not shared: each worker replica gets its own InMemoryStore, so two
 //     concurrent replicas can both treat the same event as fresh and
 //     double-process it.
+//   - Not bounded: keys are never evicted, so memory grows with the number
+//     of distinct events the process has seen for as long as it runs. This
+//     project's scale-to-zero operating model (ADR-002) bounds a worker
+//     pod's typical lifetime in practice; a long-lived deployment outside
+//     that model would need eviction or a real backend.
 //
 // Within a single process, CheckAndMark is safe for concurrent use and
 // atomic: two goroutines racing on the same key never both observe

@@ -91,6 +91,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	logger.Warn("deduplication is in-memory and per-process",
+		"durable", false,
+		"shared_across_replicas", false,
+	)
+
 	w := worker.New(worker.Worker{
 		SQSClient:     clients.SQS,
 		QueueURL:      queueURL,
