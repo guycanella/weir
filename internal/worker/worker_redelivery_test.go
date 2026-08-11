@@ -179,10 +179,10 @@ func TestDeletedMessageIsNotRedeliveredAfterVisibilityTimeoutExpiry(t *testing.T
 //
 // Concurrency is pinned to 1 EXPLICITLY, not left to New's default, because
 // this test's assertions depend on it: since WR-022, Process runs in a
-// per-message goroutine, so anything above 1 would both race on the shared
-// body log and make the ["m1", "m2"] order a matter of scheduling. At 1, m1 is
-// processed and deleted strictly before m2 is even received. The log is still
-// mutex-guarded — Process runs off Run's goroutine even at Concurrency 1.
+// per-message goroutine, so anything above 1 would make the ["m1", "m2"] order
+// a matter of scheduling. At 1, m1 isprocessed and deleted strictly before m2 
+// is even received. The log is still mutex-guarded — Process runs off Run's 
+// goroutine even at Concurrency 1.
 func TestExpireInFlightRequeuesOnlyUndeletedMessages(t *testing.T) {
 	f, queueURL := newFakeQueue(t)
 	seed(t, f, queueURL, 2)
