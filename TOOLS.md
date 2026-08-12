@@ -26,6 +26,7 @@ see the LocalStack row below.
 | kind node image | `kindest/node:v1.35.5` (tag, not digest — see note) | Overrides kind v0.32.0's default (1.36.1) so the local cluster's control-plane version matches the Kubernetes 1.35 generation everything else above is pinned to. |
 | golangci-lint | `v2.12.2` | Latest stable release at pin time (verified against upstream release history, not a reviewer's example version). Pinned explicitly so a future release can't silently change lint results without a repository change — CI installs this exact version via `golangci-lint-action`'s `version` input. |
 | LocalStack | `localstack/localstack:4.14.0` | The original WR-002 pin (`2026.06.3`) turned out to be broken: LocalStack ended free Community Docker distribution on 2026-03-23 — since then `localstack/localstack` and `localstack/localstack-pro` are the *same* image on Docker Hub and it unconditionally requires a paid `LOCALSTACK_AUTH_TOKEN` (confirmed live: the container exits with code 55, "License activation failed... LocalStack pro features can only be used with a valid license", regardless of which `SERVICES` are requested — not a Lambda-only gate). `4.14.0` is the last free, no-auth-token, semver-tagged Community release before that cutover, confirmed live to start cleanly (`healthy` status) and serve S3, SNS, SQS, and Lambda (including a real Lambda invocation via the Docker-executor path) under `SERVICES=s3,sns,sqs,lambda`. That Docker-executor path is why `make localstack-up` mounts the host `/var/run/docker.sock` into the container — a deliberate, scoped, local-dev-only exception (see the comment above the mount in `Makefile`). |
+| `ko` | `v0.19.1` | Latest tagged release at pin time (`go install github.com/google/ko@latest` resolved this exact version live). `ko` has no other tool in this matrix to stay compatible with — it only needs a Go toolchain new enough to build `cmd/worker` (satisfied by the `1.26.5` pin above) and a container runtime to load into (Docker, already required by `kind`/`localstack-up`). Auto-installed into `./bin` via `make tools` (`GOBIN=$(LOCALBIN) go install github.com/google/ko@$(KO_VERSION)`), the same pattern as `controller-gen`/`setup-envtest`, rather than PATH-checked via the `need` macro like `kind`/`kubectl`/`docker` — `ko` is a plain `go install`-able Go binary with no external system dependency to wrap, so auto-installing it reproduces the exact pinned version on any machine instead of trusting whatever a human happened to install themselves. |
 
 ## Why Kubernetes 1.35, not the newest 1.36
 
@@ -64,8 +65,9 @@ tested window to 1.36+ — likely around the task that installs KEDA (WR-036) or
 ## Where this is wired
 
 - `Makefile`: `ENVTEST_K8S_VERSION`, `KIND_NODE_IMAGE`, `CONTROLLER_GEN_VERSION`,
-  `SETUP_ENVTEST_VERSION`, `KEDA_VERSION`, `LOCALSTACK_IMAGE` variables reference the pins
-  above; `make tools`, `make envtest`, `make kind-up`, and `make localstack-up` consume them.
+  `SETUP_ENVTEST_VERSION`, `KEDA_VERSION`, `LOCALSTACK_IMAGE`, `KO_VERSION` variables reference
+  the pins above; `make tools`, `make envtest`, `make kind-up`, `make localstack-up`, and
+  `make docker-build`/`make worker-pod-up` consume them.
 - kubebuilder itself (`v4.14.0`) is not a Makefile variable — it is a one-time scaffolding
   tool invoked directly (`kubebuilder init` / `kubebuilder create api`) in WR-011 onward, not
   something `make` installs or runs repeatedly.

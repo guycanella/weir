@@ -1,0 +1,82 @@
+# hack/worker-pod.yaml — WR-026 smoke check
+#
+# Minimal Pod used only to prove the worker binary (cmd/worker, WR-021) runs
+# as a real container inside the local kind cluster — the "worker runs as a
+# pod in kind" half of WR-026's Done-when. Like hack/hello-pod.yaml (WR-004),
+# this is NOT a production deployment: the real worker Deployment (with an
+# owner ref back to a ProcessingPipeline, replica scaling, etc.) is the
+# operator's job (WR-030+), not this task's.
+#
+# Image resolution: `image: ko://<import path>` is ko's special scheme —
+# `ko apply -f hack/worker-pod.yaml` (see `make worker-pod-up`) builds
+# ./cmd/worker, publishes it, and rewrites this field to the real resolved
+# image reference in one step. Plain `kubectl apply` CANNOT consume this
+# file as-is (ko:// is not a real registry) — you must go through
+# `make worker-pod-up`.
+#
+# Network reachability (see the `kind-connect-localstack` Makefile target
+# for the full why): LocalStack's container is attached to the `kind`
+# Docker network alongside this cluster's nodes, reachable by its container
+# name. AWS_ENDPOINT_URL below hardcodes `http://weir-localstack:4566` —
+# this MUST match the `LOCALSTACK_CONTAINER` variable in the Makefile. If
+# that variable is ever renamed, update this file too (there is no
+# templating here on purpose — see the Makefile briefing's MVP-first note;
+# a Helm-templated value is WR-030/WR-051's job).
+#
+# Prerequisites this manifest does NOT automate (unlike WR-027's eventual
+# provisioning pipeline): the SQS queue and S3 bucket below must already
+# exist in LocalStack before applying this Pod, or cmd/worker's first
+# ReceiveMessage call fails, `run()` returns an error, and the Pod exits
+# non-zero — with `restartPolicy: Never` below, it then terminates in
+# `Failed` rather than crash-looping (see cmd/worker/main.go's own doc
+# comment). That's deliberate: it keeps the failed pod and its logs around
+# for inspection via `kubectl logs`, instead of churning them via repeated
+# restarts. Create the queue/bucket first, e.g.:
+#   aws --endpoint-url=http://localhost:4566 sqs create-queue \
+#     --queue-name weir-worker-smoke
+#   aws --endpoint-url=http://localhost:4566 s3 mb \
+#     s3://weir-worker-smoke-out
+# then adjust QUEUE_URL below to match the queue URL LocalStack returns
+# (LocalStack's default test account id is 000000000000).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: weir-worker-smoke
+  labels:
+    app: weir-worker-smoke
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  containers:
+    - name: worker
+      image: ko://github.com/guycanella/weir/cmd/worker
+      env:
+        - name: QUEUE_URL
+          value: "http://weir-localstack:4566/000000000000/weir-worker-smoke"
+        - name: AWS_REGION
+          value: "us-east-2"
+        - name: OUTPUT_BUCKET
+          value: "weir-worker-smoke-out"
+        - name: AWS_ENDPOINT_URL
+          value: "http://weir-localstack:4566"
+        - name: AWS_ACCESS_KEY_ID
+          value: "test"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "test"
+        - name: AWS_EC2_METADATA_DISABLED
+          value: "true"
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
