@@ -107,9 +107,20 @@ k8s_resource(
 )
 
 # --- TODO: hooks for later phases ----------------------------------------
-# WR-026 (ko build): add a custom_build/ko-backed image build for
-#   cmd/operator and cmd/worker once those binaries exist, so `tilt up`
-#   rebuilds and redeploys on save.
+# WR-026 (ko build) — worker half DONE: `make docker-build` builds
+#   cmd/worker with ko into the local Docker daemon, and `make worker-pod-up`
+#   / `make worker-pod-down` (see hack/worker-pod.yaml) build+load+apply a
+#   ko://-referenced smoke-check Pod straight into kind via
+#   KO_DOCKER_REPO=kind.local. Those two are deliberately plain `make`
+#   targets, not wired into this Tiltfile yet, because worker-pod-up needs a
+#   pre-existing LocalStack queue/bucket this task doesn't auto-provision
+#   (see hack/worker-pod.yaml's header) — wiring a `local_resource`/
+#   `k8s_yaml(kustomize(...))` here that rebuilds cmd/worker on every save
+#   is left for whichever task automates that provisioning (WR-027) or wires
+#   the real worker Deployment (WR-030+), so `tilt up` can depend on it
+#   cleanly instead of racing a missing queue.
+#   `cmd/operator`'s ko/Tilt wiring remains open — lands whenever that
+#   binary's own task addresses it.
 # WR-011+ (operator scaffold): once kubebuilder scaffolds config/, add
 #   k8s_yaml(kustomize('config/default')) (or the CRD/RBAC/manager split
 #   kubebuilder generates) alongside/instead of hack/hello-pod.yaml.
